@@ -34,7 +34,7 @@ async fn authorized_client_completes_handshake_over_udp() {
     ))
     .unwrap();
 
-    let mut server = Server::bind(secrets).await.unwrap();
+    let server = Server::bind(secrets).await.unwrap();
     let addr = server.local_addr();
 
     // The server side of the proof: accept() must yield a Connection, which the
@@ -96,7 +96,7 @@ async fn stream_echo_roundtrips_over_udp() {
     ))
     .unwrap();
 
-    let mut server = Server::bind(secrets).await.unwrap();
+    let server = Server::bind(secrets).await.unwrap();
     let addr = server.local_addr();
 
     // Server: accept the connection, then accept a stream, read it, echo it back.
@@ -163,7 +163,7 @@ async fn bounded_read_rejects_oversized_stream() {
         common::bind_addr_string()
     ))
     .unwrap();
-    let mut server = Server::bind(secrets).await.unwrap();
+    let server = Server::bind(secrets).await.unwrap();
     let addr = server.local_addr();
 
     let server_task = tokio::spawn(async move {
@@ -184,7 +184,11 @@ async fn bounded_read_rejects_oversized_stream() {
         .read_to_end(4)
         .await
         .expect_err("five bytes must exceed a four-byte limit");
-    assert!(matches!(err, ConnError::ReadLimitExceeded { limit: 4 }));
+    assert_eq!(err.prefix, b"1234");
+    assert!(matches!(
+        err.error,
+        ConnError::ReadLimitExceeded { limit: 4 }
+    ));
     server_task.await.expect("server task");
 }
 
@@ -196,7 +200,7 @@ async fn split_stream_reads_incrementally_before_fin() {
         common::bind_addr_string()
     ))
     .unwrap();
-    let mut server = Server::bind(secrets).await.unwrap();
+    let server = Server::bind(secrets).await.unwrap();
     let addr = server.local_addr();
 
     let server_task = tokio::spawn(async move {
@@ -242,7 +246,7 @@ async fn client_can_pin_its_local_source_port() {
         common::bind_addr_string()
     ))
     .unwrap();
-    let mut server = Server::bind(secrets).await.unwrap();
+    let server = Server::bind(secrets).await.unwrap();
     let addr = server.local_addr();
 
     // Grab a free UDP port, then release it for the client to claim.

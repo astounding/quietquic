@@ -63,7 +63,7 @@ fn long_header_with_dcid(dcid: &[u8]) -> Vec<u8> {
 /// Send `payloads` at the server from a fresh client socket and assert the
 /// server (a) never yields a connection and (b) sends zero bytes back.
 async fn assert_silent(payloads: &[Vec<u8>]) {
-    let mut server = Server::bind(secrets_one_client())
+    let server = Server::bind(secrets_one_client())
         .await
         .expect("bind server");
     let server_addr = server.local_addr();
@@ -171,7 +171,7 @@ async fn flood_of_junk_is_silent_and_server_stays_live() {
     ))
     .unwrap();
 
-    let mut server = Server::bind(secrets).await.expect("bind server");
+    let server = Server::bind(secrets).await.expect("bind server");
     let server_addr = server.local_addr();
 
     // Flood: thousands of junk long-header datagrams with random (non-selector)

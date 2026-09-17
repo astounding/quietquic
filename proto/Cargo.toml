@@ -26,7 +26,7 @@ hex = "0.4"
 # whole crypto stack shares one backend.
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "log", "bloom"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["aws-lc-rs", "std"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "0.8"

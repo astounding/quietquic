@@ -25,12 +25,15 @@ doesn't advertise itself to the internet) to frame however it likes.
 > has extensive automated tests but has not yet received an independent
 > cryptographic review. Do not treat it as production-hardened.
 
+This checkout documents the **unreleased shared-endpoint API**. Platform and
+cross-host release validation remain separate gates.
+
 ## Architecture: two crates, pick your I/O model
 
 | Crate | What it is | Use it when |
 |---|---|---|
 | **`quietquic-proto`** (`proto/`) | The **sans-IO core**. No I/O, no async runtime, no threads, and it never blocks or reads the clock — you own the socket and pass `now` in. | You have your own event loop, or you're embedding via FFI |
-| **`quietquic`** (repo root) | A thin **tokio** wrapper over the core: owns a UDP socket, runs a driver task, exposes `async` `Server`/`Client`/`Connection`/`SendStream`/`RecvStream`. | Your application is already `async`/`.await` |
+| **`quietquic`** (repo root) | A thin **tokio** wrapper over the core: owns a UDP socket, runs a driver task, exposes `Endpoint`, `Connection`, and uniquely owned stream halves, with `Server`/`Client` conveniences. | Your application is already `async`/`.await` |
 
 This mirrors `quinn-proto`/`quinn`, and it exists because the two I/O models are
 mutually exclusive: tokio owns the thread and parks in `epoll`/`kqueue` when
@@ -107,19 +110,22 @@ psk = "3f9a1c...<64 hex chars>...b2"
 server = "203.0.113.7:443"
 ```
 
-### 4. Server: bind and accept connections
+### 4. Bind an accept-capable endpoint
 
 ```rust
 use quietquic::config::{FileSource, SecretSource};
-use quietquic::server::Server;
+use quietquic::endpoint::{Endpoint, EndpointConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secrets = FileSource::new("server.toml").load()?;
-    let mut server = Server::bind(secrets).await?;
-    println!("listening on {}", server.local_addr());
+    let endpoint = Endpoint::bind(
+        secrets.listen,
+        EndpointConfig::accept(secrets.clients),
+    ).await?;
+    println!("listening on {}", endpoint.local_addr());
 
-    while let Some(conn) = server.accept().await {
+    while let Some(conn) = endpoint.accept().await? {
         tokio::spawn(async move {
             // Only ever fires for a peer that proved PSK possession and
             // completed the QUIC handshake — unauthorized peers never reach
@@ -134,31 +140,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### 5. Client: connect and open a stream
+### 5. Dial and open a stream
 
 ```rust
-use quietquic::client::Client;
 use quietquic::config::ClientConfigFile;
+use quietquic::endpoint::{Endpoint, EndpointConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let text = std::fs::read_to_string("client.toml")?;
     let cfg: ClientConfigFile = toml::from_str(&text)?;
 
-    let conn = Client::connect(cfg).await?;
-    let (mut send, _recv) = conn.open_bi().await?;
+    let endpoint = Endpoint::bind("0.0.0.0:0".parse()?, EndpointConfig::dial()).await?;
+    let conn = endpoint.connect(cfg).await?;
+    let (mut send, recv) = conn.open_bi().await?;
     send.write_all(b"hello over a cloaked pipe").await?;
     send.finish_and_wait().await?;
+    drop(recv);
     Ok(())
 }
 ```
 
-The primary surface is `Server::bind` / `Server::accept`, `Client::connect`,
-`Connection::open_bi` / `accept_bi` / `close(code, reason)` / `closed()`,
+The primary Tokio surface is `Endpoint::bind` / `from_socket` / `connect` /
+`accept`, `Connection::open_bi` / `accept_bi` / `close(code, reason)` / `closed()`,
 `SendStream::write_all` / `finish` / `wait_finished` / `finish_and_wait` /
 `reset`, and `RecvStream::read` / `read_to_end(limit)` / `stop`.
 `Connection::client_id` identifies an accepted peer on the server. Framing on
-top of these raw byte streams is left to the caller.
+top of these raw byte streams is left to the caller. `Server` and `Client`
+remain convenience wrappers and delegate to the same endpoint driver. See the
+[shared endpoint guide](docs/shared-endpoints.md) for fixed-port multi-dial,
+combined dial/accept, admission pause, ownership, and shutdown behavior.
 
 For full-duplex or untrusted-size traffic, keep both halves and read
 incrementally:
@@ -201,15 +212,10 @@ parsing, or a patched quinn-proto dependency; the `Option<u64>` field remains in
 the API for a future upstream accessor if one appears. This release does not
 include, require, or commit to an upstream quinn-proto PR for that accessor.
 
-The underlying `quinn_proto::Connection` is reachable via
-`Connection::quinn_connection()`, which returns a `QuinnHandle` exposing
-bidirectional-stream commands (`open_bi` / `accept_bi`, plus by-id
-`finish`/`wait_finished`) routed through the same driver channel the cloaking
-layer uses — so the cloaking/routing code does not have to change to layer a
-higher-level protocol on top. Note that this is a seam for a FUTURE direction,
-not a drop-in today: HTTP/3, for example, also needs unidirectional streams (h3
-uses uni streams for its control stream and QPACK encoder/decoder), and the
-handle does not yet expose uni-stream commands. See
+`Connection::quinn_connection()` returns a cloneable `QuinnHandle` for opening
+and accepting uniquely owned bidirectional stream halves through the shared
+driver. Reads, writes, and FIN observation use those halves. HTTP/3 integration
+remains future work because unidirectional streams are not exposed yet. See
 [Limitations](#limitations--not-yet-production-hardened) below.
 
 ---
@@ -264,9 +270,9 @@ These are known, deliberate boundaries of the current implementation —
 surfaced here so users know exactly where the edges are, rather than
 discovering them under load.
 
-1. **Single-threaded driver.** Both the server and client each run a single
-   sans-IO driver task that awaits `socket.send_to()` inline while pumping
-   connections. This is a single-threaded throughput chokepoint: fine for a
+1. **Single-task endpoint driver.** Each endpoint runs one sans-IO driver task
+   that owns its socket and pumps all of its connections. This is a throughput
+   chokepoint: fine for a
    handful of concurrent clients (the expected backup-transport use case), but
    not tuned for high fan-out (hundreds+ of simultaneous connections on one
    server).

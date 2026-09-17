@@ -51,6 +51,9 @@ pub enum ConnError {
     /// no further stream work can be done on it.
     #[error("connection closed")]
     Closed,
+    /// The connection terminated with a persistent transport cause.
+    #[error("connection lost: {reason}")]
+    ConnectionLost { reason: ConnectionError },
     /// The peer asked us to stop sending on this stream.
     #[error("stream stopped by peer: code {code}")]
     Stopped { code: u64 },
@@ -71,6 +74,53 @@ pub enum ConnError {
     Transport(String),
 }
 
+/// QuietQUIC-reserved application codes used for automatic stream cleanup.
+///
+/// Applications must use codes below [`AUTO_CODE_START`]. Keeping automatic
+/// cleanup distinguishable makes an abandoned local operation observable at
+/// the peer without conflating it with an application protocol error.
+pub const AUTO_CODE_START: u64 = (1u64 << 62) - 16;
+pub const AUTO_RESET_DROPPED_SEND: u64 = AUTO_CODE_START;
+pub const AUTO_STOP_DROPPED_RECV: u64 = AUTO_CODE_START + 1;
+pub const AUTO_RESET_CANCELLED_WRITE: u64 = AUTO_CODE_START + 2;
+pub const AUTO_RESET_CANCELLED_OPEN: u64 = AUTO_CODE_START + 3;
+pub const AUTO_STOP_CANCELLED_OPEN: u64 = AUTO_CODE_START + 4;
+pub const AUTO_STOP_READ_LIMIT: u64 = AUTO_CODE_START + 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomaticCode {
+    DroppedSend,
+    DroppedRecv,
+    CancelledWrite,
+    CancelledOpenSend,
+    CancelledOpenRecv,
+    ReadLimit,
+}
+
+impl AutomaticCode {
+    pub fn from_code(code: u64) -> Option<Self> {
+        Some(match code {
+            AUTO_RESET_DROPPED_SEND => Self::DroppedSend,
+            AUTO_STOP_DROPPED_RECV => Self::DroppedRecv,
+            AUTO_RESET_CANCELLED_WRITE => Self::CancelledWrite,
+            AUTO_RESET_CANCELLED_OPEN => Self::CancelledOpenSend,
+            AUTO_STOP_CANCELLED_OPEN => Self::CancelledOpenRecv,
+            AUTO_STOP_READ_LIMIT => Self::ReadLimit,
+            _ => return None,
+        })
+    }
+}
+
+/// Result of requesting a reset of a send stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResetOutcome {
+    ResetRequested,
+    AlreadyAcknowledged,
+    AlreadyReset { code: u64 },
+    PeerStopped { code: u64 },
+}
+
 /// Terminal/near-terminal state of a stream's send half.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -81,6 +131,8 @@ pub enum SendFin {
     Acked,
     /// The peer sent STOP_SENDING; the FIN will never be acknowledged.
     Stopped(u64),
+    /// The local endpoint requested a reset. This wins over a later FIN ACK.
+    Reset(u64),
 }
 
 /// What one [`ConnState::service_streams`] pass observed.
@@ -91,6 +143,8 @@ pub enum SendFin {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ConnProgress {
+    /// The caller should schedule another bounded service pass promptly.
+    pub more_work: bool,
     /// The handshake completed this pass.
     pub connected: bool,
     /// The connection was lost this pass.
@@ -152,6 +206,7 @@ pub struct ConnState {
     finished_reads: HashSet<StreamId>,
     /// Streams whose send half reached a stable finish/stop fact.
     send_fins: HashMap<StreamId, SendFin>,
+    recv_errors: HashMap<StreamId, ConnError>,
     /// Set by any caller-side operation that can produce something to send, and
     /// cleared by the endpoint's servicing pass that flushes it.
     ///
@@ -165,6 +220,7 @@ pub struct ConnState {
     /// unsent the peer sends nothing, and with nothing arriving nothing wakes
     /// the loop.
     dirty: bool,
+    draining_opened: bool,
 }
 
 impl ConnState {
@@ -175,7 +231,9 @@ impl ConnState {
             ready_accepts: VecDeque::new(),
             finished_reads: HashSet::new(),
             send_fins: HashMap::new(),
+            recv_errors: HashMap::new(),
             dirty: false,
+            draining_opened: false,
         }
     }
 
@@ -207,6 +265,12 @@ impl ConnState {
         Ok(self.conn.streams().accept(Dir::Bi))
     }
 
+    /// Return an accepted stream to the front of the FIFO when delivery to an
+    /// application waiter was canceled before handoff.
+    pub fn put_back_accepted(&mut self, id: StreamId) {
+        self.ready_accepts.push_front(id);
+    }
+
     /// Read whatever is buffered on `id` into `buf`, up to `buf.len()` bytes.
     ///
     /// Three answers, and only three:
@@ -226,6 +290,9 @@ impl ConnState {
 
         if self.finished_reads.contains(&id) {
             return Ok(ReadOutcome::Finished);
+        }
+        if let Some(err) = self.recv_errors.remove(&id) {
+            return Err(err);
         }
         if buf.is_empty() {
             // Nothing was asked for, so nothing was read. Reporting `Read(0)`
@@ -293,6 +360,9 @@ impl ConnState {
         // Bytes we did copy are owed to the caller even if the stream then
         // errored — report them now and let the next read surface the error.
         if filled > 0 {
+            if let Some(err) = errored {
+                self.recv_errors.insert(id, err);
+            }
             return Ok(ReadOutcome::Read(filled));
         }
         if let Some(err) = errored {
@@ -336,7 +406,9 @@ impl ConnState {
     pub fn stream_finish(&mut self, id: StreamId) -> Result<(), ConnError> {
         match self.send_fins.get(&id).copied() {
             Some(SendFin::Stopped(code)) => return Err(ConnError::Stopped { code }),
-            Some(SendFin::Acked | SendFin::Queued) => return Err(ConnError::ClosedStream),
+            Some(SendFin::Acked | SendFin::Queued | SendFin::Reset(_)) => {
+                return Err(ConnError::ClosedStream)
+            }
             None => {}
         }
         self.dirty = true;
@@ -357,20 +429,41 @@ impl ConnState {
     /// Abandon the send half of `id` with an application error code, discarding
     /// anything not yet delivered.
     ///
-    /// Also forgets `id`'s end-of-stream bookkeeping, but only in the case where
-    /// there is any: the receive half must already have reached clean EOS for
-    /// this to remove anything, and a stream that is finished for reading and
-    /// reset for writing is over in both directions. See
-    /// [`ConnState::forget_stream`].
-    pub fn stream_reset(&mut self, id: StreamId, code: u64) -> Result<(), ConnError> {
+    /// The first terminal fact wins and is returned on later calls: an earlier
+    /// FIN acknowledgement or peer STOP is not overwritten by reset, and an
+    /// accepted reset retains its original code. The opposite receive half and
+    /// its EOF/error bookkeeping remain independent.
+    pub fn stream_reset(&mut self, id: StreamId, code: u64) -> Result<ResetOutcome, ConnError> {
+        if code >= AUTO_CODE_START {
+            return Err(ConnError::InvalidErrorCode { code });
+        }
+        self.stream_reset_inner(id, code)
+    }
+
+    #[doc(hidden)]
+    pub fn stream_reset_auto(
+        &mut self,
+        id: StreamId,
+        code: u64,
+    ) -> Result<ResetOutcome, ConnError> {
+        self.stream_reset_inner(id, code)
+    }
+
+    fn stream_reset_inner(&mut self, id: StreamId, code: u64) -> Result<ResetOutcome, ConnError> {
         let code = varint(code)?;
+        match self.send_fins.get(&id).copied() {
+            Some(SendFin::Acked) => return Ok(ResetOutcome::AlreadyAcknowledged),
+            Some(SendFin::Stopped(code)) => return Ok(ResetOutcome::PeerStopped { code }),
+            Some(SendFin::Reset(code)) => return Ok(ResetOutcome::AlreadyReset { code }),
+            Some(SendFin::Queued) | None => {}
+        }
         self.dirty = true;
-        self.finished_reads.remove(&id);
-        self.send_fins.remove(&id);
         self.conn
             .send_stream(id)
             .reset(code)
-            .map_err(|_| ConnError::ClosedStream)
+            .map_err(|_| ConnError::ClosedStream)?;
+        self.send_fins.insert(id, SendFin::Reset(code.into_inner()));
+        Ok(ResetOutcome::ResetRequested)
     }
 
     /// Tell the peer to stop sending on `id`, with an application error code.
@@ -379,9 +472,22 @@ impl ConnState {
     /// abandoned the receive half, so there is no further read to answer
     /// [`ReadOutcome::Finished`] for. See [`ConnState::forget_stream`].
     pub fn stream_stop(&mut self, id: StreamId, code: u64) -> Result<(), ConnError> {
+        if code >= AUTO_CODE_START {
+            return Err(ConnError::InvalidErrorCode { code });
+        }
+        self.stream_stop_inner(id, code)
+    }
+
+    #[doc(hidden)]
+    pub fn stream_stop_auto(&mut self, id: StreamId, code: u64) -> Result<(), ConnError> {
+        self.stream_stop_inner(id, code)
+    }
+
+    fn stream_stop_inner(&mut self, id: StreamId, code: u64) -> Result<(), ConnError> {
         let code = varint(code)?;
         self.dirty = true;
         self.finished_reads.remove(&id);
+        self.recv_errors.remove(&id);
         self.conn
             .recv_stream(id)
             .stop(code)
@@ -411,6 +517,7 @@ impl ConnState {
     /// Release this stream's stable receive end-of-stream fact.
     pub fn forget_recv(&mut self, id: StreamId) {
         self.finished_reads.remove(&id);
+        self.recv_errors.remove(&id);
     }
 
     /// Release this stream's stable send-half finish/stop fact.
@@ -429,20 +536,44 @@ impl ConnState {
     /// This is the SINGLE place `poll()` may be called on this connection —
     /// `poll()` consumes events, so a second drainer would silently eat them.
     /// Call it after every datagram and every timeout.
-    pub fn service_streams(&mut self) -> ConnProgress {
+    pub fn service_streams(&mut self, max_work: usize) -> ConnProgress {
         use quinn_proto::{Event, StreamEvent};
 
         let mut progress = ConnProgress::default();
-        while let Some(ev) = self.conn.poll() {
+        let mut remaining = max_work.max(1);
+        if self.draining_opened {
+            while remaining > 0 {
+                let Some(id) = self.conn.streams().accept(Dir::Bi) else {
+                    self.draining_opened = false;
+                    break;
+                };
+                self.ready_accepts.push_back(id);
+                progress.opened.push(id);
+                remaining -= 1;
+            }
+            if self.draining_opened && remaining == 0 {
+                progress.more_work = true;
+                return progress;
+            }
+        }
+        while remaining > 0 {
+            let Some(ev) = self.conn.poll() else { break };
+            remaining -= 1;
             match ev {
                 Event::Connected => progress.connected = true,
                 Event::ConnectionLost { reason } => {
                     progress.lost = Some(ConnectionError::from_quinn(reason));
                 }
                 Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
-                    while let Some(id) = self.conn.streams().accept(Dir::Bi) {
+                    self.draining_opened = true;
+                    while remaining > 0 {
+                        let Some(id) = self.conn.streams().accept(Dir::Bi) else {
+                            self.draining_opened = false;
+                            break;
+                        };
                         self.ready_accepts.push_back(id);
                         progress.opened.push(id);
+                        remaining -= 1;
                     }
                 }
                 Event::Stream(StreamEvent::Readable { id }) => progress.readable.push(id),
@@ -461,12 +592,13 @@ impl ConnState {
                 _ => {}
             }
         }
+        progress.more_work = self.draining_opened || remaining == 0;
         progress
     }
 
     fn record_send_fin(&mut self, id: StreamId, fact: SendFin) -> bool {
         match self.send_fins.get(&id).copied() {
-            Some(SendFin::Acked | SendFin::Stopped(_)) => false,
+            Some(SendFin::Acked | SendFin::Stopped(_) | SendFin::Reset(_)) => false,
             Some(SendFin::Queued) | None => {
                 self.send_fins.insert(id, fact);
                 matches!(fact, SendFin::Acked | SendFin::Stopped(_))

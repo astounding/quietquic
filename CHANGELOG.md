@@ -3,6 +3,27 @@
 All notable user-visible changes are recorded here. This project follows
 Semantic Versioning while its wire protocol and Rust API remain experimental.
 
+## Unreleased
+
+- Require Rustls 0.23.45 or newer and update its cryptographic dependencies to
+  address RUSTSEC-2026-0285.
+
+- Add a socket-owning, cloneable Tokio `Endpoint` with fixed construction-time
+  dial, accept, or combined capabilities; repeated connections share one UDP
+  socket and fixed local port.
+- Add owned-socket construction, admission pause/resume, bounded incoming and
+  command queues, connection configuration snapshots, per-attempt overrides,
+  persistent endpoint termination causes, and bounded `wait_closed` cleanup.
+- Define cancellation and drop behavior for connection attempts, accepts,
+  stream opens, reads, writes, FIN waits, and uniquely owned stream halves.
+- Add structured reset outcomes, reserved automatic-cleanup codes,
+  `try_open_bi`, and partial-prefix ownership in `ReadToEndError`.
+- Keep `Server` and `Client` as conveniences backed by the shared endpoint
+  driver, and document migration to the primary `Endpoint` API.
+- Add deterministic and real-UDP coverage for overlapping fixed-port dials,
+  simultaneous initiation, sibling isolation, admission control, endpoint
+  retention, socket release, and supplied IPv6 sockets.
+
 ## 0.1.0-alpha.3 — 2026-07-29
 
 - Skip publishing `0.1.0-alpha.2`; alpha.3 is the next intended public crate

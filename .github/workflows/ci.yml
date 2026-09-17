@@ -1,36 +1,76 @@
 name: ci
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 jobs:
   test:
+    timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with: { persist-credentials: false }
       - uses: dtolnay/rust-toolchain@stable
         with: { components: clippy, rustfmt }
+      - name: Record candidate and environment
+        run: |
+          git rev-parse HEAD
+          uname -a
+          rustc -Vv
+          cargo -V
       - run: cargo fmt --all -- --check
-      - run: cargo test --workspace --all-targets
-      - run: cargo test --workspace --doc
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-      - run: cargo package -p quietquic-proto
-      - run: cargo package -p quietquic
+      - run: cargo test --locked --workspace --all-targets
+      - run: cargo test --locked --workspace --doc
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+      - name: Validate paired candidate packages with fresh consumers
+        if: matrix.os == 'ubuntu-latest'
+        run: scripts/check-packages.sh --online
       - uses: EmbarkStudios/cargo-deny-action@v2
         if: matrix.os == 'ubuntu-latest'
       # The sans-IO core must stay drivable from a hand-rolled event loop, and
       # the reference loop is documentation people copy — so it is compiled and
       # RUN here, not merely built.
-      - run: cargo run -p quietquic-proto --example poll_loop
+      - run: cargo run --locked -p quietquic-proto --example poll_loop
       # The core must never grow a runtime dependency; that is the whole point
       # of the crate split.
       - name: quietquic-proto has no tokio
-        run: "! cargo tree -p quietquic-proto | grep -qi tokio"
-  freebsd:
+        run: |
+          cargo tree --locked -p quietquic-proto > core-dependencies.txt
+          cat core-dependencies.txt
+          if grep -qi tokio core-dependencies.txt; then exit 1; fi
+  msrv:
+    name: Rust 1.88 minimum supported version
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Record candidate and environment
+        run: |
+          git rev-parse HEAD
+          uname -a
+          rustc -Vv
+          cargo -V
+      - run: cargo test --locked --workspace --all-targets
+      - run: cargo test --locked --workspace --doc
+      - run: cargo run --locked -p quietquic-proto --example poll_loop
+  freebsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
       - uses: vmactions/freebsd-vm@v1
         with:
           usesh: true
@@ -38,6 +78,10 @@ jobs:
           # build fails with an unobvious error without it.
           prepare: pkg install -y rust cmake
           run: |
-            cargo test --workspace --all-targets
-            cargo test --workspace --doc
-            cargo run -p quietquic-proto --example poll_loop
+            set -eu
+            uname -a
+            rustc -Vv
+            cargo -V
+            cargo test --locked --workspace --all-targets
+            cargo test --locked --workspace --doc
+            cargo run --locked -p quietquic-proto --example poll_loop

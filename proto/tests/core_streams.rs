@@ -32,7 +32,7 @@ use quinn_proto::{
     EndpointConfig, ServerConfig as TransportServerConfig, StreamId,
 };
 
-use quietquic_proto::conn::ConnState;
+use quietquic_proto::conn::{ConnState, ResetOutcome};
 use quietquic_proto::crypto::{reset_key, token_key, SelfSigned};
 use quietquic_proto::outcome::{ReadOutcome, WriteOutcome};
 
@@ -174,7 +174,7 @@ fn pump(
         }
     }
     // The SOLE `conn.poll()` caller, exactly as in the real drivers.
-    let _ = state.service_streams();
+    let _ = state.service_streams(usize::MAX);
 
     let mut out = Vec::new();
     let mut buf = Vec::new();
@@ -339,6 +339,20 @@ fn read_on_an_idle_stream_reports_blocked_not_an_error() {
     );
 }
 
+#[test]
+fn reset_is_idempotent_and_retains_original_code() {
+    let mut pair = connected_pair();
+    let id = pair.client.open_bi().expect("open_bi");
+    assert_eq!(
+        pair.client.stream_reset(id, 17).unwrap(),
+        ResetOutcome::ResetRequested
+    );
+    assert_eq!(
+        pair.client.stream_reset(id, 29).unwrap(),
+        ResetOutcome::AlreadyReset { code: 17 }
+    );
+}
+
 /// A stream that has delivered all its data but has NOT been finished still
 /// reports `Blocked` — `Blocked` and `Finished` are distinct answers, and
 /// conflating them would truncate a peer mid-message.
@@ -472,7 +486,7 @@ fn locally_closed_connection_reaches_is_drained_without_a_lost_event() {
             Some(at) => pair.client.conn_mut().handle_timeout(at),
             None => break,
         }
-        saw_lost |= pair.client.service_streams().lost.is_some();
+        saw_lost |= pair.client.service_streams(usize::MAX).lost.is_some();
     }
 
     assert!(

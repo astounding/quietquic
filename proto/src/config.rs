@@ -6,9 +6,66 @@
 //! `quietquic::config::FileSource`, which reads the file (and warns about
 //! group/world-readable permissions) before handing the text here.
 
+use quinn_proto::{TransportConfig, VarInt};
 use serde::Deserialize;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+/// Largest library-managed deadline accepted by endpoint configuration.
+pub const MAX_ENDPOINT_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Cloneable immutable QUIC transport snapshot.
+///
+/// Construction always disables unidirectional stream credit because this
+/// release exposes bidirectional streams only.
+#[derive(Clone)]
+pub struct TransportSettings(Arc<TransportConfig>);
+
+impl TransportSettings {
+    pub fn new(mut config: TransportConfig) -> Self {
+        config.max_concurrent_uni_streams(VarInt::from_u32(0));
+        Self(Arc::new(config))
+    }
+
+    pub fn as_quinn(&self) -> &TransportConfig {
+        &self.0
+    }
+
+    pub(crate) fn arc(&self) -> Arc<TransportConfig> {
+        self.0.clone()
+    }
+}
+
+impl From<TransportConfig> for TransportSettings {
+    fn from(value: TransportConfig) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Debug for TransportSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TransportSettings(..)")
+    }
+}
+
+impl Default for TransportSettings {
+    fn default() -> Self {
+        let mut transport = TransportConfig::default();
+        transport.max_idle_timeout(Some(
+            Duration::from_secs(60)
+                .try_into()
+                .expect("60s fits QUIC varint"),
+        ));
+        transport.keep_alive_interval(Some(Duration::from_secs(20)));
+        transport.max_concurrent_bidi_streams(VarInt::from_u32(32));
+        transport.stream_receive_window(VarInt::from_u32(1024 * 1024));
+        transport.receive_window(VarInt::from_u32(8 * 1024 * 1024));
+        transport.send_window(8 * 1024 * 1024);
+        Self::new(transport)
+    }
+}
 
 /// A 32-byte pre-shared key. Zeroized on drop; `Debug` never prints the bytes.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -80,6 +137,173 @@ pub struct ClientConfigFile {
     pub bind: Option<SocketAddr>,
 }
 
+/// Operations an endpoint may initiate. Capabilities are fixed at construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    Dial,
+    Accept,
+    Both,
+}
+
+impl Capability {
+    pub const fn can_dial(self) -> bool {
+        matches!(self, Self::Dial | Self::Both)
+    }
+
+    pub const fn can_accept(self) -> bool {
+        matches!(self, Self::Accept | Self::Both)
+    }
+}
+
+/// Immutable defaults copied by each newly-created connection.
+#[derive(Clone)]
+pub struct EndpointConfig {
+    pub capability: Capability,
+    pub credentials: Vec<ClientEntry>,
+    pub transport: TransportSettings,
+    pub max_pending_incoming: usize,
+    pub outgoing_handshake_timeout: Duration,
+    pub incoming_handshake_timeout: Duration,
+    pub cleanup_timeout: Duration,
+    /// Maximum endpoint events and datagrams processed for one connection in a pass.
+    pub max_connection_work: usize,
+    /// Maximum datagrams buffered by the sans-I/O endpoint for its caller.
+    pub max_outbound_datagrams: usize,
+}
+
+impl std::fmt::Debug for EndpointConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EndpointConfig")
+            .field("capability", &self.capability)
+            .field("credentials", &self.credentials.len())
+            .field("transport", &self.transport)
+            .field("max_pending_incoming", &self.max_pending_incoming)
+            .field(
+                "outgoing_handshake_timeout",
+                &self.outgoing_handshake_timeout,
+            )
+            .field(
+                "incoming_handshake_timeout",
+                &self.incoming_handshake_timeout,
+            )
+            .field("cleanup_timeout", &self.cleanup_timeout)
+            .field("max_connection_work", &self.max_connection_work)
+            .field("max_outbound_datagrams", &self.max_outbound_datagrams)
+            .finish()
+    }
+}
+
+impl EndpointConfig {
+    pub fn dial() -> Self {
+        Self {
+            capability: Capability::Dial,
+            ..Self::default()
+        }
+    }
+
+    pub fn accept(credentials: Vec<ClientEntry>) -> Self {
+        Self {
+            capability: Capability::Accept,
+            credentials,
+            ..Self::default()
+        }
+    }
+
+    pub fn both(credentials: Vec<ClientEntry>) -> Self {
+        Self {
+            capability: Capability::Both,
+            credentials,
+            ..Self::default()
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.capability.can_accept() && self.credentials.is_empty() {
+            return Err(ConfigError::Invalid(
+                "accept capability requires credentials".into(),
+            ));
+        }
+        if self.max_pending_incoming == 0 {
+            return Err(ConfigError::Invalid(
+                "max_pending_incoming must be positive".into(),
+            ));
+        }
+        if self.max_connection_work == 0 {
+            return Err(ConfigError::Invalid(
+                "max_connection_work must be positive".into(),
+            ));
+        }
+        if self.max_outbound_datagrams == 0 {
+            return Err(ConfigError::Invalid(
+                "max_outbound_datagrams must be positive".into(),
+            ));
+        }
+        for (name, value) in [
+            (
+                "outgoing_handshake_timeout",
+                self.outgoing_handshake_timeout,
+            ),
+            (
+                "incoming_handshake_timeout",
+                self.incoming_handshake_timeout,
+            ),
+            ("cleanup_timeout", self.cleanup_timeout),
+        ] {
+            if value.is_zero() {
+                return Err(ConfigError::Invalid(format!(
+                    "{name} must be finite and positive"
+                )));
+            }
+            if value > MAX_ENDPOINT_DURATION {
+                return Err(ConfigError::Invalid(format!(
+                    "{name} exceeds the 24 hour maximum"
+                )));
+            }
+        }
+        validate_credentials(&self.credentials)
+    }
+}
+
+impl Default for EndpointConfig {
+    fn default() -> Self {
+        Self {
+            capability: Capability::Dial,
+            credentials: Vec::new(),
+            transport: TransportSettings::default(),
+            max_pending_incoming: 128,
+            outgoing_handshake_timeout: Duration::from_secs(10),
+            incoming_handshake_timeout: Duration::from_secs(10),
+            cleanup_timeout: Duration::from_secs(10),
+            max_connection_work: 64,
+            max_outbound_datagrams: 256,
+        }
+    }
+}
+
+pub(crate) fn validate_credentials(entries: &[ClientEntry]) -> Result<(), ConfigError> {
+    use std::collections::HashSet;
+    let mut ids = HashSet::new();
+    let mut psks = HashSet::new();
+    for entry in entries {
+        if entry.client_id.trim().is_empty() {
+            return Err(ConfigError::Invalid("client_id must not be empty".into()));
+        }
+        if !ids.insert(entry.client_id.clone()) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate client_id {:?}",
+                entry.client_id
+            )));
+        }
+        if !psks.insert(*entry.psk.as_bytes()) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate PSK makes client identity ambiguous (client_id {:?})",
+                entry.client_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Errors that can occur while loading or parsing config/secrets.
 ///
 /// The `Io` variant exists for consumers that load config from a file (see
@@ -135,5 +359,52 @@ psk = "xyz"
             ConfigError::Invalid("duplicate client_id".into()).to_string(),
             "invalid configuration: duplicate client_id"
         );
+    }
+
+    #[test]
+    fn endpoint_deadlines_and_caps_must_be_positive() {
+        let mut cfg = EndpointConfig::dial();
+        cfg.outgoing_handshake_timeout = Duration::ZERO;
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+
+        let mut cfg = EndpointConfig::dial();
+        cfg.cleanup_timeout = Duration::MAX;
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+
+        let mut cfg = EndpointConfig::dial();
+        cfg.max_pending_incoming = 0;
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+
+        let mut cfg = EndpointConfig::dial();
+        cfg.max_outbound_datagrams = 0;
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn accepting_requires_credentials() {
+        assert!(EndpointConfig::dial().validate().is_ok());
+        assert!(matches!(
+            EndpointConfig::accept(Vec::new()).validate(),
+            Err(ConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn capabilities_are_fixed_and_explicit() {
+        assert!(Capability::Dial.can_dial());
+        assert!(!Capability::Dial.can_accept());
+        assert!(Capability::Accept.can_accept());
+        assert!(!Capability::Accept.can_dial());
+        assert!(Capability::Both.can_dial());
+        assert!(Capability::Both.can_accept());
+    }
+
+    #[test]
+    fn custom_transport_always_disables_unidirectional_credit() {
+        let mut transport = TransportConfig::default();
+        transport.max_concurrent_uni_streams(VarInt::from_u32(17));
+        let settings = TransportSettings::new(transport);
+        let debug = format!("{:?}", settings.as_quinn());
+        assert!(debug.contains("max_concurrent_uni_streams: 0"), "{debug}");
     }
 }

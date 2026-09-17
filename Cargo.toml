@@ -22,6 +22,7 @@ quietquic-proto = { version = "=0.1.0-alpha.3", path = "proto" }
 bytes = "1"
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "log", "bloom"] }
 thiserror = "2"
+socket2 = "0.6"
 # Only `rt` is required, deliberately NOT `rt-multi-thread`: the runtime flavor
 # is the application's choice, and a current-thread runtime is a legitimate and
 # useful configuration (one OS thread, cooperative scheduling). Forcing the
@@ -34,4 +35,4 @@ tracing = "0.1"
 aws-lc-rs = "1"
 tokio = { version = "1", features = ["full"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["aws-lc-rs", "std"] }

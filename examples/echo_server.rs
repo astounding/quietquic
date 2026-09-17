@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "listen = \"{listen}\"\n[[clients]]\nclient_id = \"{client_id}\"\npsk = \"{psk}\"\n"
     ))?;
 
-    let mut server = Server::bind(secrets).await?;
+    let server = Server::bind(secrets).await?;
     println!("listening on {} (udp)", server.local_addr());
     println!("waiting for an authorized peer; anything else is ignored silently");
 

@@ -4,8 +4,14 @@
   protocol for the current experimental release.
 - The root [`README.md`](../README.md) is the current user guide, API overview,
   threat model, and limitations list.
+- [`shared-endpoints.md`](shared-endpoints.md) is the current Tokio endpoint API,
+  ownership, cancellation, shutdown, and migration guide.
 - [`../SECURITY.md`](../SECURITY.md) states security status and reporting policy.
-- Files under `plans/` are archived implementation plans. They intentionally
+- [`plans/2026-09-17-shared-endpoint-release.md`](plans/2026-09-17-shared-endpoint-release.md)
+  is the active release-validation plan, consolidating endpoint/stream contracts
+  and flagging qquicusock requirements and potential impacts. The current Rust
+  API is documented in `shared-endpoints.md`; unchecked plan gates remain work.
+- Other files under `plans/` are archived implementation plans. They intentionally
   preserve intermediate APIs, `todo!()` examples, and expected-failure notes;
   they are not current usage documentation.
 - Dated files under `specs/` and `notes/` are historical design records unless

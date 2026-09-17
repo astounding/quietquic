@@ -6,15 +6,13 @@
 //! service timers, drain app events). Application code cannot hold the
 //! `Connection` directly without stalling that pump. So [`Connection`] and
 //! [`SendStream`] / [`RecvStream`] here are *lightweight handles*: they send
-//! commands to the driver over a [`tokio::sync::mpsc`] channel and await replies over
-//! [`tokio::sync::oneshot`] channels. The driver applies each command against
+//! commands to the driver over a bounded [`tokio::sync::mpsc`] channel. Owned
+//! replies remain reclaimable until the application receives them. The driver applies each command against
 //! the owned `quinn_proto::Connection` inside its event loop and routes stream
 //! events back.
 //!
-//! This module is deliberately transport-agnostic: the server driver
-//! ([`crate::server`]) and the client driver ([`crate::client`]) both translate
-//! the same `Cmd`s, so the stream plumbing is written once and lives in
-//! neither `server.rs` nor `client.rs`.
+//! The shared driver in [`crate::endpoint`] uses this plumbing for incoming and
+//! outgoing connections. The client and server conveniences use that same driver.
 //!
 //! # Why the *parking* lives here and not in the core
 //!
@@ -36,18 +34,137 @@
 //! hand out a `&quinn_proto::Connection` reference (it lives on another task,
 //! mutated behind the command channel). Instead [`Connection::quinn_connection`]
 //! returns a [`QuinnHandle`]: the minimal, `Clone`able command surface an
-//! `h3`-style layer needs (open/accept bidirectional streams, read/write/finish
-//! by `StreamId`) without ever touching the cloaking/pre-filter layer. See
+//! a stream protocol can use to open/accept uniquely owned bidirectional halves
+//! without touching the cloaking/pre-filter layer. See
 //! [`QuinnHandle`] for the shape and the rationale.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bytes::Bytes;
 use quietquic_proto::conn::{ConnState as CoreConn, SendFin};
 use quietquic_proto::outcome::{ConnectionHandle, ReadOutcome, WriteOutcome};
 use quinn_proto::{StreamId, VarInt};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
+
+struct HandoffState<T> {
+    value: Option<T>,
+    canceled: bool,
+    claimed: bool,
+}
+pub(crate) struct HandoffTx<T> {
+    state: Arc<Mutex<HandoffState<T>>>,
+    notify: Arc<Notify>,
+    completed: bool,
+}
+struct HandoffRx<T> {
+    state: Arc<Mutex<HandoffState<T>>>,
+    notify: Arc<Notify>,
+    reclaim: Option<Box<dyn FnOnce(T) + Send>>,
+    cancel: Option<Box<dyn FnOnce() + Send>>,
+}
+
+fn handoff<T>(
+    reclaim: impl FnOnce(T) + Send + 'static,
+    cancel: impl FnOnce() + Send + 'static,
+) -> (HandoffTx<T>, HandoffRx<T>) {
+    let state = Arc::new(Mutex::new(HandoffState {
+        value: None,
+        canceled: false,
+        claimed: false,
+    }));
+    let notify = Arc::new(Notify::new());
+    (
+        HandoffTx {
+            state: state.clone(),
+            notify: notify.clone(),
+            completed: false,
+        },
+        HandoffRx {
+            state,
+            notify,
+            reclaim: Some(Box::new(reclaim)),
+            cancel: Some(Box::new(cancel)),
+        },
+    )
+}
+
+impl<T> HandoffTx<T> {
+    fn is_closed(&self) -> bool {
+        self.state.lock().unwrap().canceled
+    }
+    fn send(mut self, value: T) -> Result<(), T> {
+        let mut state = self.state.lock().unwrap();
+        if state.canceled {
+            return Err(value);
+        }
+        state.value = Some(value);
+        drop(state);
+        self.completed = true;
+        self.notify.notify_one();
+        Ok(())
+    }
+}
+
+impl<T> HandoffRx<T> {
+    async fn receive(mut self) -> Option<T> {
+        loop {
+            let notified = self.notify.notified();
+            let outcome = {
+                let mut state = self.state.lock().unwrap();
+                if let Some(value) = state.value.take() {
+                    state.claimed = true;
+                    Some(Ok(value))
+                } else if state.canceled {
+                    Some(Err(()))
+                } else {
+                    None
+                }
+            };
+            if let Some(Ok(value)) = outcome {
+                self.reclaim = None;
+                self.cancel = None;
+                return Some(value);
+            }
+            if matches!(outcome, Some(Err(()))) {
+                return None;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl<T> Drop for HandoffTx<T> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.canceled = true;
+        drop(state);
+        self.notify.notify_one();
+    }
+}
+
+impl<T> Drop for HandoffRx<T> {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        if state.claimed {
+            return;
+        }
+        state.canceled = true;
+        let value = state.value.take();
+        drop(state);
+        if let (Some(value), Some(reclaim)) = (value, self.reclaim.take()) {
+            reclaim(value);
+        }
+        if let Some(cancel) = self.cancel.take() {
+            cancel();
+        }
+    }
+}
 
 /// Errors surfaced by [`Connection`], [`SendStream`], and [`RecvStream`]
 /// operations.
@@ -56,7 +173,11 @@ use tokio::sync::{mpsc, oneshot, watch};
 /// layers report failures in the same vocabulary — a hand-rolled embedder and a
 /// tokio application see one error type, not two that must be translated. It is
 /// re-exported here so `quietquic::conn::ConnError` keeps resolving.
-pub use quietquic_proto::conn::ConnError;
+pub use quietquic_proto::conn::{
+    ConnError, ResetOutcome, AUTO_CODE_START, AUTO_RESET_CANCELLED_OPEN,
+    AUTO_RESET_CANCELLED_WRITE, AUTO_RESET_DROPPED_SEND, AUTO_STOP_CANCELLED_OPEN,
+    AUTO_STOP_DROPPED_RECV, AUTO_STOP_READ_LIMIT,
+};
 pub use quietquic_proto::outcome::ConnectionError;
 
 /// A command paired with the connection it targets. The driver owns one
@@ -68,6 +189,38 @@ pub(crate) struct Tagged {
     pub(crate) cmd: Cmd,
 }
 
+pub(crate) struct TaggedCleanup {
+    pub(crate) handle: ConnectionHandle,
+    pub(crate) cleanup: Cleanup,
+}
+
+#[derive(Debug)]
+pub(crate) enum Cleanup {
+    ResetSend { id: StreamId, code: u64 },
+    DropSend { id: StreamId },
+    StopRecv { id: StreamId, code: u64 },
+    ReturnAccepted { id: StreamId },
+    ReleaseRecv { id: StreamId },
+    ReleaseSend { id: StreamId },
+    ForgetStream { id: StreamId },
+    Wake,
+    OwnerDropped,
+}
+
+pub(crate) struct OwnerLease {
+    handle: ConnectionHandle,
+    cleanup: mpsc::UnboundedSender<TaggedCleanup>,
+}
+
+impl Drop for OwnerLease {
+    fn drop(&mut self) {
+        let _ = self.cleanup.send(TaggedCleanup {
+            handle: self.handle,
+            cleanup: Cleanup::OwnerDropped,
+        });
+    }
+}
+
 /// A [`Cmd`] channel sender pre-bound to one connection's handle, so handles can
 /// enqueue commands without knowing the routing key. Cloned freely across a
 /// connection's [`Connection`] / [`SendStream`] / [`RecvStream`] /
@@ -76,21 +229,89 @@ pub(crate) struct Tagged {
 pub(crate) struct CmdSender {
     handle: ConnectionHandle,
     tx: mpsc::Sender<Tagged>,
+    cleanup: mpsc::UnboundedSender<TaggedCleanup>,
+    _owner: Arc<OwnerLease>,
+    closed: watch::Receiver<Option<ConnectionError>>,
+    write_budget: Arc<Semaphore>,
+    open_budget: Arc<Semaphore>,
+    accept_budget: Arc<Semaphore>,
 }
 
 impl CmdSender {
-    pub(crate) fn new(handle: ConnectionHandle, tx: mpsc::Sender<Tagged>) -> Self {
-        Self { handle, tx }
+    pub(crate) fn new(
+        handle: ConnectionHandle,
+        tx: mpsc::Sender<Tagged>,
+        cleanup: mpsc::UnboundedSender<TaggedCleanup>,
+        closed: watch::Receiver<Option<ConnectionError>>,
+    ) -> Self {
+        let owner = Arc::new(OwnerLease {
+            handle,
+            cleanup: cleanup.clone(),
+        });
+        Self {
+            handle,
+            tx,
+            cleanup,
+            _owner: owner,
+            closed,
+            write_budget: Arc::new(Semaphore::new(256 * 1024)),
+            open_budget: Arc::new(Semaphore::new(256)),
+            accept_budget: Arc::new(Semaphore::new(256)),
+        }
     }
 
     async fn send(&self, cmd: Cmd) -> Result<(), ConnError> {
-        self.tx
-            .send(Tagged {
-                handle: self.handle,
-                cmd,
-            })
-            .await
-            .map_err(|_| ConnError::Closed)
+        if let Some(reason) = self.closed.borrow().clone() {
+            return Err(ConnError::ConnectionLost { reason });
+        }
+        let mut closed = self.closed.clone();
+        tokio::select! {
+            result = self.tx.send(Tagged { handle: self.handle, cmd }) => {
+                result.map_err(|_| self.terminal_error().unwrap_or(ConnError::Closed))
+            }
+            changed = closed.changed() => {
+                if changed.is_err() { Err(ConnError::Closed) }
+                else { Err(self.terminal_error().unwrap_or(ConnError::Closed)) }
+            }
+        }
+    }
+
+    fn terminal_error(&self) -> Option<ConnError> {
+        self.closed
+            .borrow()
+            .clone()
+            .map(|reason| ConnError::ConnectionLost { reason })
+    }
+
+    async fn acquire_operation(
+        &self,
+        budget: Arc<Semaphore>,
+    ) -> Result<OwnedSemaphorePermit, ConnError> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
+        let mut closed = self.closed.clone();
+        tokio::select! {
+            permit = budget.acquire_owned() => permit.map_err(|_| ConnError::Closed),
+            changed = closed.changed() => {
+                if changed.is_err() { Err(ConnError::Closed) }
+                else { Err(self.terminal_error().unwrap_or(ConnError::Closed)) }
+            }
+        }
+    }
+
+    async fn acquire_write(&self, bytes: u32) -> Result<OwnedSemaphorePermit, ConnError> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
+        let mut closed = self.closed.clone();
+        tokio::select! {
+            permit = self.write_budget.clone().acquire_many_owned(bytes) => permit.map_err(|_| ConnError::Closed),
+            changed = closed.changed() => {
+                if changed.is_err() { Err(ConnError::Closed) }
+                else { Err(self.terminal_error().unwrap_or(ConnError::Closed)) }
+            }
+        }
     }
 
     fn try_send(&self, cmd: Cmd) -> Result<(), mpsc::error::TrySendError<Tagged>> {
@@ -98,6 +319,13 @@ impl CmdSender {
             handle: self.handle,
             cmd,
         })
+    }
+
+    fn cleanup(&self, cleanup: Cleanup) {
+        let _ = self.cleanup.send(TaggedCleanup {
+            handle: self.handle,
+            cleanup,
+        });
     }
 }
 
@@ -109,31 +337,37 @@ impl CmdSender {
 /// `Connection` while letting handles await outcomes.
 pub(crate) enum Cmd {
     /// Open a new bidirectional stream; reply with its assigned id.
-    OpenBi(oneshot::Sender<Result<StreamId, ConnError>>),
+    OpenBi(HandoffTx<Result<StreamId, ConnError>>),
+    TryOpenBi(HandoffTx<Result<TryOpenOutcome<StreamId>, ConnError>>),
     /// Await the next peer-initiated bidirectional stream; reply with its id.
-    AcceptBi(oneshot::Sender<Result<StreamId, ConnError>>),
+    AcceptBi(HandoffTx<Result<StreamId, ConnError>>),
     /// Append `data` to a send stream. Replies once fully buffered (the driver
     /// handles write-blocking internally and re-tries on `Writable`).
     Write {
         id: StreamId,
         data: Vec<u8>,
         reply: oneshot::Sender<Result<(), ConnError>>,
+        started: Arc<AtomicBool>,
+        permit: OwnedSemaphorePermit,
     },
     /// Finish (FIN) a send stream.
     Finish {
         id: StreamId,
         reply: oneshot::Sender<Result<(), ConnError>>,
+        finished: Arc<AtomicBool>,
+        terminal: Arc<Mutex<Option<Result<(), ConnError>>>>,
     },
     /// Wait until a previously finished send stream reaches a terminal fact.
     WaitFinished {
         id: StreamId,
         reply: oneshot::Sender<Result<(), ConnError>>,
+        terminal: Arc<Mutex<Option<Result<(), ConnError>>>>,
     },
     /// Reset a send stream locally.
     Reset {
         id: StreamId,
         code: VarInt,
-        reply: oneshot::Sender<Result<(), ConnError>>,
+        reply: oneshot::Sender<Result<ResetOutcome, ConnError>>,
     },
     /// Stop a receive stream locally.
     Stop {
@@ -141,35 +375,52 @@ pub(crate) enum Cmd {
         code: VarInt,
         reply: oneshot::Sender<Result<(), ConnError>>,
     },
-    /// Release the core's send-half finish/stop fact.
-    ReleaseSend { id: StreamId },
     /// Read a recv stream to end-of-stream; reply with all bytes once FIN is
     /// observed (or an error if the stream is reset).
     ReadToEnd {
         id: StreamId,
         limit: usize,
-        reply: oneshot::Sender<Result<Vec<u8>, ConnError>>,
+        reply: HandoffTx<Result<Vec<u8>, ReadToEndError>>,
+        recovery: Arc<Mutex<RecvRecovery>>,
     },
     /// Read up to `max` bytes, completing as soon as any data or FIN is
     /// available. An empty vector means clean end-of-stream.
     Read {
         id: StreamId,
         max: usize,
-        reply: oneshot::Sender<Result<Vec<u8>, ConnError>>,
+        reply: HandoffTx<Result<Vec<u8>, ConnError>>,
+        recovery: Arc<Mutex<RecvRecovery>>,
     },
     /// Close the connection with an application error code, sending a
     /// CONNECTION_CLOSE frame so the peer (and this side's driver) tear down
     /// promptly rather than waiting out the idle timeout.
-    Close { code: VarInt, reason: Vec<u8> },
+    Close {
+        code: VarInt,
+        reason: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TryOpenOutcome<T = (SendStream, RecvStream)> {
+    Opened(T),
+    TemporarilyUnavailable,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("stream read failed after {prefix_len} bytes: {error}", prefix_len = .prefix.len())]
+pub struct ReadToEndError {
+    pub prefix: Vec<u8>,
+    pub error: ConnError,
 }
 
 /// A post-handshake, PSK-authenticated QUIC connection.
 ///
 /// Produced by the server (on `accept`) and the client (once its handshake
 /// reaches `Connected`), so both sides surface the same type. A `Connection` is
-/// a handle onto a connection the driver still owns and pumps; dropping it does
-/// not tear the connection down (the driver keeps running until the peer closes
-/// or the driver's owner is dropped).
+/// a handle onto a connection the driver owns and pumps. Connection clones,
+/// stream halves, and QuinnHandle clones retain it. Dropping the last such
+/// application owner initiates bounded connection cleanup; explicit close
+/// overrides retained owners.
 #[derive(Clone)]
 pub struct Connection {
     remote: std::net::SocketAddr,
@@ -219,17 +470,87 @@ impl Connection {
 
     /// Open a new bidirectional stream.
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), ConnError> {
-        let (tx, rx) = oneshot::channel();
+        let _permit = self
+            .cmds
+            .acquire_operation(self.cmds.open_budget.clone())
+            .await?;
+        let cleanup = self.cmds.clone();
+        let wake = self.cmds.clone();
+        let (tx, rx) = handoff(
+            move |result| {
+                if let Ok(id) = result {
+                    cleanup.cleanup(Cleanup::ResetSend {
+                        id,
+                        code: AUTO_RESET_CANCELLED_OPEN,
+                    });
+                    cleanup.cleanup(Cleanup::StopRecv {
+                        id,
+                        code: AUTO_STOP_CANCELLED_OPEN,
+                    });
+                    cleanup.cleanup(Cleanup::ForgetStream { id });
+                }
+            },
+            move || wake.cleanup(Cleanup::Wake),
+        );
         self.cmds.send(Cmd::OpenBi(tx)).await?;
-        let id = rx.await.map_err(|_| ConnError::Closed)??;
+        let id = rx.receive().await.ok_or(ConnError::Closed)??;
         Ok(bi_stream(id, self.cmds.clone()))
+    }
+
+    pub async fn try_open_bi(&self) -> Result<TryOpenOutcome, ConnError> {
+        if let Some(error) = self.cmds.terminal_error() {
+            return Err(error);
+        }
+        let Ok(_permit) = self.cmds.open_budget.clone().try_acquire_owned() else {
+            return Ok(TryOpenOutcome::TemporarilyUnavailable);
+        };
+        let cleanup = self.cmds.clone();
+        let wake = self.cmds.clone();
+        let (tx, rx) = handoff(
+            move |result| {
+                if let Ok(TryOpenOutcome::Opened(id)) = result {
+                    cleanup.cleanup(Cleanup::ResetSend {
+                        id,
+                        code: AUTO_RESET_CANCELLED_OPEN,
+                    });
+                    cleanup.cleanup(Cleanup::StopRecv {
+                        id,
+                        code: AUTO_STOP_CANCELLED_OPEN,
+                    });
+                    cleanup.cleanup(Cleanup::ForgetStream { id });
+                }
+            },
+            move || wake.cleanup(Cleanup::Wake),
+        );
+        if self.cmds.try_send(Cmd::TryOpenBi(tx)).is_err() {
+            return Ok(TryOpenOutcome::TemporarilyUnavailable);
+        }
+        match rx.receive().await.ok_or(ConnError::Closed)?? {
+            TryOpenOutcome::Opened(id) => {
+                Ok(TryOpenOutcome::Opened(bi_stream(id, self.cmds.clone())))
+            }
+            TryOpenOutcome::TemporarilyUnavailable => Ok(TryOpenOutcome::TemporarilyUnavailable),
+        }
     }
 
     /// Await the next bidirectional stream the peer opens.
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), ConnError> {
-        let (tx, rx) = oneshot::channel();
+        let _permit = self
+            .cmds
+            .acquire_operation(self.cmds.accept_budget.clone())
+            .await?;
+        let cleanup = self.cmds.clone();
+        let wake = self.cmds.clone();
+        let (tx, rx) = handoff(
+            move |result| {
+                if let Ok(id) = result {
+                    cleanup.cleanup(Cleanup::ReturnAccepted { id });
+                }
+            },
+            move || wake.cleanup(Cleanup::Wake),
+        );
         self.cmds.send(Cmd::AcceptBi(tx)).await?;
-        let id = rx.await.map_err(|_| ConnError::Closed)??;
+        let id = rx.receive().await.ok_or(ConnError::Closed)??;
         Ok(bi_stream(id, self.cmds.clone()))
     }
 
@@ -237,7 +558,7 @@ impl Connection {
     /// down promptly (rather than waiting out the idle timeout). Best-effort: if
     /// the driver is already gone the connection is effectively closed anyway.
     pub async fn close(&self, code: u64, reason: &[u8]) -> Result<(), ConnError> {
-        let code = varint(code)?;
+        let code = app_varint(code)?;
         let _ = self
             .cmds
             .send(Cmd::Close {
@@ -261,19 +582,9 @@ impl Connection {
         }
     }
 
-    /// The forward-compat escape hatch: a minimal, `Clone`able handle onto the
-    /// underlying QUIC connection that lets `h3` (or any other stream protocol)
-    /// be layered on top **without touching the cloaking / pre-filter layer**.
-    ///
-    /// It intentionally does *not* return `&quinn_proto::Connection`: the driver
-    /// owns that value on another task and mutates it behind the command
-    /// channel, so a borrow cannot be handed out. Instead this exposes the
-    /// operations an h3 layer actually needs — open/accept bidirectional
-    /// streams and read/write/finish by `StreamId` — as async methods that route
-    /// through the same command channel. When h3 is added it drives its control
-    /// and request streams entirely through this handle; nothing in `server.rs`
-    /// / `client.rs` (the silence-critical routing) has to change. See
-    /// [`QuinnHandle`].
+    /// Return a cloneable handle for opening and accepting uniquely owned
+    /// bidirectional stream halves through the shared driver. The underlying
+    /// Quinn connection remains driver-owned. See [`QuinnHandle`].
     pub fn quinn_connection(&self) -> QuinnHandle {
         QuinnHandle {
             handle: self.handle,
@@ -316,37 +627,52 @@ impl QuinnHandle {
 
     /// Open a new bidirectional stream.
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), ConnError> {
-        let (tx, rx) = oneshot::channel();
+        let _permit = self
+            .cmds
+            .acquire_operation(self.cmds.open_budget.clone())
+            .await?;
+        let cleanup = self.cmds.clone();
+        let wake = self.cmds.clone();
+        let (tx, rx) = handoff(
+            move |result| {
+                if let Ok(id) = result {
+                    cleanup.cleanup(Cleanup::ResetSend {
+                        id,
+                        code: AUTO_RESET_CANCELLED_OPEN,
+                    });
+                    cleanup.cleanup(Cleanup::StopRecv {
+                        id,
+                        code: AUTO_STOP_CANCELLED_OPEN,
+                    });
+                    cleanup.cleanup(Cleanup::ForgetStream { id });
+                }
+            },
+            move || wake.cleanup(Cleanup::Wake),
+        );
         self.cmds.send(Cmd::OpenBi(tx)).await?;
-        let id = rx.await.map_err(|_| ConnError::Closed)??;
+        let id = rx.receive().await.ok_or(ConnError::Closed)??;
         Ok(bi_stream(id, self.cmds.clone()))
     }
 
     /// Await the next peer-initiated bidirectional stream.
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), ConnError> {
-        let (tx, rx) = oneshot::channel();
+        let _permit = self
+            .cmds
+            .acquire_operation(self.cmds.accept_budget.clone())
+            .await?;
+        let cleanup = self.cmds.clone();
+        let wake = self.cmds.clone();
+        let (tx, rx) = handoff(
+            move |result| {
+                if let Ok(id) = result {
+                    cleanup.cleanup(Cleanup::ReturnAccepted { id });
+                }
+            },
+            move || wake.cleanup(Cleanup::Wake),
+        );
         self.cmds.send(Cmd::AcceptBi(tx)).await?;
-        let id = rx.await.map_err(|_| ConnError::Closed)??;
+        let id = rx.receive().await.ok_or(ConnError::Closed)??;
         Ok(bi_stream(id, self.cmds.clone()))
-    }
-
-    pub async fn finish(&self, id: StreamId) -> Result<(), ConnError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmds.send(Cmd::Finish { id, reply: tx }).await?;
-        rx.await.map_err(|_| ConnError::Closed)?
-    }
-
-    pub async fn wait_finished(&self, id: StreamId) -> Result<(), ConnError> {
-        wait_finished(&self.cmds, id).await
-    }
-
-    pub async fn finish_and_wait(&self, id: StreamId) -> Result<(), ConnError> {
-        self.finish(id).await?;
-        self.wait_finished(id).await
-    }
-
-    pub async fn forget_send(&self, id: StreamId) {
-        let _ = self.cmds.send(Cmd::ReleaseSend { id }).await;
     }
 }
 
@@ -354,6 +680,15 @@ impl QuinnHandle {
 pub struct RecvStream {
     id: StreamId,
     cmds: CmdSender,
+    done: bool,
+    recovery: Arc<Mutex<RecvRecovery>>,
+}
+
+#[derive(Default)]
+pub(crate) struct RecvRecovery {
+    bytes: Vec<u8>,
+    error: Option<ConnError>,
+    eof: bool,
 }
 
 impl RecvStream {
@@ -362,23 +697,103 @@ impl RecvStream {
     }
 
     pub async fn read(&mut self, max: usize) -> Result<Vec<u8>, ConnError> {
-        read_chunk(&self.cmds, self.id, max).await
+        if max > 0 {
+            let mut recovery = self.recovery.lock().unwrap();
+            if !recovery.bytes.is_empty() {
+                let split = max.min(recovery.bytes.len());
+                return Ok(recovery.bytes.drain(..split).collect());
+            }
+            if let Some(error) = recovery.error.take() {
+                return Err(error);
+            }
+            if recovery.eof {
+                self.done = true;
+                return Ok(Vec::new());
+            }
+        }
+        let bytes = read_chunk(&self.cmds, self.id, max, self.recovery.clone()).await?;
+        if max > 0 && bytes.is_empty() {
+            self.done = true;
+        }
+        Ok(bytes)
     }
 
-    pub async fn read_to_end(&mut self, limit: usize) -> Result<Vec<u8>, ConnError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmds
+    pub async fn read_to_end(&mut self, limit: usize) -> Result<Vec<u8>, ReadToEndError> {
+        {
+            let mut recovery = self.recovery.lock().unwrap();
+            if recovery.bytes.len() > limit {
+                recovery.bytes.truncate(limit);
+                self.cmds.cleanup(Cleanup::StopRecv {
+                    id: self.id,
+                    code: AUTO_STOP_READ_LIMIT,
+                });
+                recovery.error = Some(ConnError::ReadLimitExceeded { limit });
+                return Err(ReadToEndError {
+                    prefix: std::mem::take(&mut recovery.bytes),
+                    error: recovery.error.take().expect("set above"),
+                });
+            }
+            if let Some(error) = recovery.error.take() {
+                return Err(ReadToEndError {
+                    prefix: std::mem::take(&mut recovery.bytes),
+                    error,
+                });
+            }
+            if recovery.eof {
+                self.done = true;
+                return Ok(std::mem::take(&mut recovery.bytes));
+            }
+        }
+        let recovery = self.recovery.clone();
+        let wake = self.cmds.clone();
+        let (tx, rx) = handoff(
+            move |result: Result<Vec<u8>, ReadToEndError>| match result {
+                Ok(bytes) => {
+                    let mut r = recovery.lock().unwrap();
+                    r.bytes = bytes;
+                    r.eof = true;
+                }
+                Err(e) => {
+                    let mut r = recovery.lock().unwrap();
+                    r.bytes = e.prefix;
+                    r.error = Some(e.error);
+                }
+            },
+            move || wake.cleanup(Cleanup::Wake),
+        );
+        if let Err(error) = self
+            .cmds
             .send(Cmd::ReadToEnd {
                 id: self.id,
                 limit,
                 reply: tx,
+                recovery: self.recovery.clone(),
             })
-            .await?;
-        rx.await.map_err(|_| ConnError::Closed)?
+            .await
+        {
+            return Err(ReadToEndError {
+                prefix: std::mem::take(&mut self.recovery.lock().unwrap().bytes),
+                error,
+            });
+        }
+        let result = match rx.receive().await {
+            Some(result) => result,
+            None => {
+                let mut recovery = self.recovery.lock().unwrap();
+                return Err(ReadToEndError {
+                    prefix: std::mem::take(&mut recovery.bytes),
+                    error: recovery.error.take().unwrap_or(ConnError::Closed),
+                });
+            }
+        };
+        if result.is_ok() {
+            self.done = true;
+        }
+        result
     }
 
     pub async fn stop(&mut self, code: u64) -> Result<(), ConnError> {
-        let code = varint(code)?;
+        let code = app_varint(code)?;
         let (tx, rx) = oneshot::channel();
         self.cmds
             .send(Cmd::Stop {
@@ -387,7 +802,24 @@ impl RecvStream {
                 reply: tx,
             })
             .await?;
-        rx.await.map_err(|_| ConnError::Closed)?
+        let result = rx.await.map_err(|_| ConnError::Closed)?;
+        if result.is_ok() {
+            self.done = true;
+        }
+        result
+    }
+}
+
+impl Drop for RecvStream {
+    fn drop(&mut self) {
+        if self.done {
+            self.cmds.cleanup(Cleanup::ReleaseRecv { id: self.id });
+        } else {
+            self.cmds.cleanup(Cleanup::StopRecv {
+                id: self.id,
+                code: AUTO_STOP_DROPPED_RECV,
+            });
+        }
     }
 }
 
@@ -395,6 +827,29 @@ impl RecvStream {
 pub struct SendStream {
     id: StreamId,
     cmds: CmdSender,
+    done: bool,
+    finished: Arc<AtomicBool>,
+    terminal: Arc<Mutex<Option<Result<(), ConnError>>>>,
+}
+
+struct WriteCancelGuard {
+    id: StreamId,
+    cmds: CmdSender,
+    started: Arc<AtomicBool>,
+    complete: bool,
+}
+
+impl Drop for WriteCancelGuard {
+    fn drop(&mut self) {
+        if !self.complete && self.started.load(Ordering::Acquire) {
+            self.cmds.cleanup(Cleanup::ResetSend {
+                id: self.id,
+                code: AUTO_RESET_CANCELLED_WRITE,
+            });
+        } else if !self.complete {
+            self.cmds.cleanup(Cleanup::Wake);
+        }
+    }
 }
 
 impl SendStream {
@@ -403,15 +858,30 @@ impl SendStream {
     }
 
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), ConnError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmds
-            .send(Cmd::Write {
-                id: self.id,
-                data: buf.to_vec(),
-                reply: tx,
-            })
-            .await?;
-        rx.await.map_err(|_| ConnError::Closed)?
+        const WRITE_CHUNK: usize = 16 * 1024;
+        let started = Arc::new(AtomicBool::new(false));
+        let mut guard = WriteCancelGuard {
+            id: self.id,
+            cmds: self.cmds.clone(),
+            started: started.clone(),
+            complete: false,
+        };
+        for chunk in buf.chunks(WRITE_CHUNK) {
+            let permit = self.cmds.acquire_write(chunk.len() as u32).await?;
+            let (tx, rx) = oneshot::channel();
+            self.cmds
+                .send(Cmd::Write {
+                    id: self.id,
+                    data: chunk.to_vec(),
+                    reply: tx,
+                    started: started.clone(),
+                    permit,
+                })
+                .await?;
+            rx.await.map_err(|_| ConnError::Closed)??;
+        }
+        guard.complete = true;
+        Ok(())
     }
 
     pub async fn finish(&mut self) -> Result<(), ConnError> {
@@ -420,13 +890,19 @@ impl SendStream {
             .send(Cmd::Finish {
                 id: self.id,
                 reply: tx,
+                finished: self.finished.clone(),
+                terminal: self.terminal.clone(),
             })
             .await?;
-        rx.await.map_err(|_| ConnError::Closed)?
+        let result = rx.await.map_err(|_| ConnError::Closed)?;
+        if result.is_ok() {
+            self.done = true;
+        }
+        result
     }
 
     pub async fn wait_finished(&mut self) -> Result<(), ConnError> {
-        wait_finished(&self.cmds, self.id).await
+        wait_finished(&self.cmds, self.id, self.terminal.clone()).await
     }
 
     pub async fn finish_and_wait(&mut self) -> Result<(), ConnError> {
@@ -434,8 +910,15 @@ impl SendStream {
         self.wait_finished().await
     }
 
-    pub async fn reset(&mut self, code: u64) -> Result<(), ConnError> {
-        let code = varint(code)?;
+    pub async fn reset(&mut self, code: u64) -> Result<ResetOutcome, ConnError> {
+        let code = app_varint(code)?;
+        if let Some(terminal) = self.terminal.lock().unwrap().clone() {
+            return match terminal {
+                Ok(()) => Ok(ResetOutcome::AlreadyAcknowledged),
+                Err(ConnError::Stopped { code }) => Ok(ResetOutcome::PeerStopped { code }),
+                Err(error) => Err(error),
+            };
+        }
         let (tx, rx) = oneshot::channel();
         self.cmds
             .send(Cmd::Reset {
@@ -444,29 +927,75 @@ impl SendStream {
                 reply: tx,
             })
             .await?;
-        rx.await.map_err(|_| ConnError::Closed)?
+        let result = rx.await.map_err(|_| ConnError::Closed)?;
+        if result.is_ok() {
+            self.done = true;
+        }
+        result
     }
 }
 
 impl Drop for SendStream {
     fn drop(&mut self) {
-        let _ = self.cmds.try_send(Cmd::ReleaseSend { id: self.id });
+        if !self.done && !self.finished.load(Ordering::Acquire) {
+            self.cmds.cleanup(Cleanup::DropSend { id: self.id });
+        } else {
+            self.cmds.cleanup(Cleanup::ReleaseSend { id: self.id });
+        }
     }
 }
 
-async fn read_chunk(cmds: &CmdSender, id: StreamId, max: usize) -> Result<Vec<u8>, ConnError> {
+async fn read_chunk(
+    cmds: &CmdSender,
+    id: StreamId,
+    max: usize,
+    recovery: Arc<Mutex<RecvRecovery>>,
+) -> Result<Vec<u8>, ConnError> {
     if max == 0 {
         return Ok(Vec::new());
     }
-    let (tx, rx) = oneshot::channel();
-    cmds.send(Cmd::Read { id, max, reply: tx }).await?;
-    rx.await.map_err(|_| ConnError::Closed)?
+    let wake = cmds.clone();
+    let reclaim = recovery.clone();
+    let (tx, rx) = handoff(
+        move |result| match result {
+            Ok(bytes) => reclaim.lock().unwrap().bytes = bytes,
+            Err(error) => reclaim.lock().unwrap().error = Some(error),
+        },
+        move || wake.cleanup(Cleanup::Wake),
+    );
+    cmds.send(Cmd::Read {
+        id,
+        max,
+        reply: tx,
+        recovery,
+    })
+    .await?;
+    rx.receive().await.ok_or(ConnError::Closed)?
 }
 
-async fn wait_finished(cmds: &CmdSender, id: StreamId) -> Result<(), ConnError> {
+async fn wait_finished(
+    cmds: &CmdSender,
+    id: StreamId,
+    terminal: Arc<Mutex<Option<Result<(), ConnError>>>>,
+) -> Result<(), ConnError> {
+    if let Some(result) = terminal.lock().unwrap().clone() {
+        return result;
+    }
     let (tx, rx) = oneshot::channel();
-    cmds.send(Cmd::WaitFinished { id, reply: tx }).await?;
-    rx.await.map_err(|_| ConnError::Closed)?
+    cmds.send(Cmd::WaitFinished {
+        id,
+        reply: tx,
+        terminal: terminal.clone(),
+    })
+    .await?;
+    match rx.await {
+        Ok(result) => result,
+        Err(_) => terminal
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(Err(ConnError::Closed)),
+    }
 }
 
 fn bi_stream(id: StreamId, cmds: CmdSender) -> (SendStream, RecvStream) {
@@ -474,13 +1003,28 @@ fn bi_stream(id: StreamId, cmds: CmdSender) -> (SendStream, RecvStream) {
         SendStream {
             id,
             cmds: cmds.clone(),
+            done: false,
+            finished: Arc::new(AtomicBool::new(false)),
+            terminal: Arc::new(Mutex::new(None)),
         },
-        RecvStream { id, cmds },
+        RecvStream {
+            id,
+            cmds,
+            done: false,
+            recovery: Arc::new(Mutex::new(RecvRecovery::default())),
+        },
     )
 }
 
 fn varint(code: u64) -> Result<VarInt, ConnError> {
     VarInt::from_u64(code).map_err(|_| ConnError::InvalidErrorCode { code })
+}
+
+fn app_varint(code: u64) -> Result<VarInt, ConnError> {
+    if code >= AUTO_CODE_START {
+        return Err(ConnError::InvalidErrorCode { code });
+    }
+    varint(code)
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +1037,8 @@ fn varint(code: u64) -> Result<VarInt, ConnError> {
 /// this is purely a batching knob; a `read_to_end` loops until `Blocked` or
 /// `Finished` regardless.
 const READ_CHUNK: usize = 16 * 1024;
+const READ_PASS_BUDGET: usize = 64 * 1024;
+const MAX_PARKED_OPS: usize = 256;
 
 /// A write that is blocked on flow control: the remaining bytes, and the reply
 /// channel to fire once the whole buffer has been accepted.
@@ -500,6 +1046,9 @@ struct PendingWrite {
     data: Vec<u8>,
     offset: usize,
     reply: oneshot::Sender<Result<(), ConnError>>,
+    started: bool,
+    call_started: Arc<AtomicBool>,
+    _permit: OwnedSemaphorePermit,
 }
 
 /// A read waiting for end-of-stream: the bytes gathered so far and the reply
@@ -510,7 +1059,42 @@ struct PendingRead {
     /// bound to distinguish an exact-size stream from an oversized one.
     end_limit: Option<usize>,
     max: Option<usize>,
-    reply: oneshot::Sender<Result<Vec<u8>, ConnError>>,
+    reply: Option<ReadReply>,
+    recovery: Arc<Mutex<RecvRecovery>>,
+}
+
+type SendTerminal = Arc<Mutex<Option<Result<(), ConnError>>>>;
+
+enum ReadReply {
+    Chunk(HandoffTx<Result<Vec<u8>, ConnError>>),
+    ToEnd(HandoffTx<Result<Vec<u8>, ReadToEndError>>),
+}
+
+impl ReadReply {
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Chunk(r) => r.is_closed(),
+            Self::ToEnd(r) => r.is_closed(),
+        }
+    }
+    fn send_ok(self, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        match self {
+            Self::Chunk(r) => r.send(Ok(bytes)).err().and_then(Result::ok),
+            Self::ToEnd(r) => r.send(Ok(bytes)).err().and_then(Result::ok),
+        }
+    }
+    fn send_err(self, prefix: Vec<u8>, error: ConnError) -> Option<(Vec<u8>, ConnError)> {
+        match self {
+            Self::Chunk(r) => match r.send(Err(error)) {
+                Err(Err(e)) => Some((prefix, e)),
+                _ => None,
+            },
+            Self::ToEnd(r) => match r.send(Err(ReadToEndError { prefix, error })) {
+                Err(Err(e)) => Some((e.prefix, e.error)),
+                _ => None,
+            },
+        }
+    }
 }
 
 /// One live connection's parked handle operations.
@@ -532,34 +1116,163 @@ struct PendingRead {
 /// and all three are failed with [`ConnError::Closed`] by [`Parked::fail_all`]
 /// when `Event::ConnectionLost` names this connection.
 pub(crate) struct Parked {
+    needs_service: bool,
+    pending_opens: VecDeque<HandoffTx<Result<StreamId, ConnError>>>,
     /// Accept requests waiting for a peer-opened bi stream, FIFO.
-    pending_accepts: VecDeque<oneshot::Sender<Result<StreamId, ConnError>>>,
+    pending_accepts: VecDeque<HandoffTx<Result<StreamId, ConnError>>>,
     /// Writes blocked on flow control, keyed by stream.
     blocked_writes: HashMap<StreamId, PendingWrite>,
     /// Reads awaiting end-of-stream, keyed by stream.
     pending_reads: HashMap<StreamId, PendingRead>,
+    retained_reads: HashMap<StreamId, Vec<u8>>,
+    retained_read_errors: HashMap<StreamId, ConnError>,
     /// Waiters awaiting this stream's send-half terminal fact.
     fin_waiters: HashMap<StreamId, Vec<oneshot::Sender<Result<(), ConnError>>>>,
+    send_terminals: HashMap<StreamId, SendTerminal>,
     closed: watch::Sender<Option<ConnectionError>>,
 }
 
 impl Parked {
     pub(crate) fn new(closed: watch::Sender<Option<ConnectionError>>) -> Self {
         Self {
+            needs_service: false,
             pending_accepts: VecDeque::new(),
+            pending_opens: VecDeque::new(),
             blocked_writes: HashMap::new(),
             pending_reads: HashMap::new(),
+            retained_reads: HashMap::new(),
+            retained_read_errors: HashMap::new(),
             fin_waiters: HashMap::new(),
+            send_terminals: HashMap::new(),
             closed,
         }
     }
 
-    pub(crate) fn subscribe_closed(&self) -> watch::Receiver<Option<ConnectionError>> {
-        self.closed.subscribe()
-    }
-
     pub(crate) fn mark_closed(&self, reason: ConnectionError) {
         let _ = self.closed.send(Some(reason));
+    }
+
+    /// Perform cancellation reclamation and retry FIFO stream openers. Drivers
+    /// call this once per bounded connection service pass, even without a QUIC
+    /// stream event.
+    pub(crate) fn maintain(&mut self, core: &mut CoreConn) {
+        self.needs_service = false;
+        self.pending_accepts.retain(|reply| !reply.is_closed());
+        self.pending_opens.retain(|reply| !reply.is_closed());
+        while let Some(reply) = self.pending_opens.pop_front() {
+            if reply.is_closed() {
+                continue;
+            }
+            match core.open_bi() {
+                Ok(id) => {
+                    if reply.send(Ok(id)).is_err() {
+                        let _ = core.stream_reset_auto(id, AUTO_RESET_CANCELLED_OPEN);
+                        let _ = core.stream_stop_auto(id, AUTO_STOP_CANCELLED_OPEN);
+                        core.forget_stream(id);
+                    }
+                }
+                Err(ConnError::ClosedStream) => {
+                    self.pending_opens.push_front(reply);
+                    break;
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            }
+        }
+        let canceled: Vec<_> = self
+            .blocked_writes
+            .iter()
+            .filter_map(|(id, p)| p.reply.is_closed().then_some(*id))
+            .collect();
+        for id in canceled {
+            if let Some(p) = self.blocked_writes.remove(&id) {
+                if p.started {
+                    let _ = core.stream_reset_auto(id, AUTO_RESET_CANCELLED_WRITE);
+                }
+            }
+        }
+        let canceled_reads: Vec<_> = self
+            .pending_reads
+            .iter()
+            .filter_map(|(id, p)| {
+                p.reply
+                    .as_ref()
+                    .is_some_and(ReadReply::is_closed)
+                    .then_some(*id)
+            })
+            .collect();
+        for id in canceled_reads {
+            if let Some(mut p) = self.pending_reads.remove(&id) {
+                let mut recovery = p.recovery.lock().unwrap();
+                recovery.bytes.append(&mut p.buf);
+            }
+        }
+        self.fin_waiters.retain(|_, waiters| {
+            waiters.retain(|reply| !reply.is_closed());
+            !waiters.is_empty()
+        });
+        let reads: Vec<_> = self.pending_reads.keys().copied().collect();
+        for id in reads {
+            let Some(mut pending) = self.pending_reads.remove(&id) else {
+                continue;
+            };
+            if !self.pump_read(core, id, &mut pending) {
+                self.pending_reads.insert(id, pending);
+            }
+        }
+    }
+
+    pub(crate) fn needs_service(&self) -> bool {
+        self.needs_service
+    }
+
+    pub(crate) fn apply_cleanup(&mut self, core: &mut CoreConn, cleanup: Cleanup) {
+        match cleanup {
+            Cleanup::ResetSend { id, code } => {
+                let outcome = core.stream_reset_auto(id, code);
+                if let Some(terminal) = self.send_terminals.get(&id) {
+                    let mut slot = terminal.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(match outcome {
+                            Ok(ResetOutcome::AlreadyAcknowledged) => Ok(()),
+                            Ok(ResetOutcome::PeerStopped { code }) => {
+                                Err(ConnError::Stopped { code })
+                            }
+                            Ok(_) => Err(ConnError::ClosedStream),
+                            Err(error) => Err(error),
+                        });
+                    }
+                }
+                self.fail_fin_waiters(id, ConnError::ClosedStream);
+                self.fail_blocked_write(id, ConnError::ClosedStream);
+            }
+            Cleanup::DropSend { id } => {
+                let _ = core.stream_reset_auto(id, AUTO_RESET_DROPPED_SEND);
+                core.forget_send(id);
+                self.fail_fin_waiters(id, ConnError::ClosedStream);
+                self.fail_blocked_write(id, ConnError::ClosedStream);
+                self.send_terminals.remove(&id);
+            }
+            Cleanup::StopRecv { id, code } => {
+                let _ = core.stream_stop_auto(id, code);
+                self.fail_pending_read(id, ConnError::ClosedStream);
+                self.retained_reads.remove(&id);
+                self.retained_read_errors.remove(&id);
+            }
+            Cleanup::ReturnAccepted { id } => {
+                core.put_back_accepted(id);
+                self.on_stream_opened(core);
+            }
+            Cleanup::ReleaseRecv { id } => core.forget_recv(id),
+            Cleanup::ReleaseSend { id } => {
+                core.forget_send(id);
+                self.send_terminals.remove(&id);
+            }
+            Cleanup::ForgetStream { id } => core.forget_stream(id),
+            Cleanup::Wake => {}
+            Cleanup::OwnerDropped => {}
+        }
     }
 
     /// Apply one handle-issued command against `core`, answering immediately
@@ -571,51 +1284,167 @@ impl Parked {
     /// is the documented order (stream work first, transmits last) and what
     /// gets the flow-control credit a read released onto the wire.
     pub(crate) fn apply_cmd(&mut self, core: &mut CoreConn, cmd: Cmd, now: Instant) {
+        self.maintain(core);
         match cmd {
             Cmd::OpenBi(reply) => {
-                let _ = reply.send(core.open_bi());
+                if reply.is_closed() {
+                    return;
+                }
+                if self.pending_opens.iter().any(|r| !r.is_closed()) {
+                    if self.pending_opens.len() >= MAX_PARKED_OPS {
+                        let _ = reply.send(Err(ConnError::Transport(
+                            "connection operation queue full".into(),
+                        )));
+                    } else {
+                        self.pending_opens.push_back(reply);
+                    }
+                    return;
+                }
+                match core.open_bi() {
+                    Ok(id) => {
+                        if reply.send(Ok(id)).is_err() {
+                            let _ = core.stream_reset_auto(id, AUTO_RESET_CANCELLED_OPEN);
+                            let _ = core.stream_stop_auto(id, AUTO_STOP_CANCELLED_OPEN);
+                            core.forget_stream(id);
+                        }
+                    }
+                    Err(ConnError::ClosedStream) => self.pending_opens.push_back(reply),
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            Cmd::TryOpenBi(reply) => {
+                if reply.is_closed() {
+                    return;
+                }
+                let answer = if self.pending_opens.iter().any(|r| !r.is_closed()) {
+                    Ok(TryOpenOutcome::TemporarilyUnavailable)
+                } else {
+                    match core.open_bi() {
+                        Ok(id) => Ok(TryOpenOutcome::Opened(id)),
+                        Err(ConnError::ClosedStream) => Ok(TryOpenOutcome::TemporarilyUnavailable),
+                        Err(e) => Err(e),
+                    }
+                };
+                if let Err(Ok(TryOpenOutcome::Opened(id))) = reply.send(answer) {
+                    let _ = core.stream_reset_auto(id, AUTO_RESET_CANCELLED_OPEN);
+                    let _ = core.stream_stop_auto(id, AUTO_STOP_CANCELLED_OPEN);
+                    core.forget_stream(id);
+                }
             }
             Cmd::AcceptBi(reply) => match core.accept_bi() {
                 Ok(Some(id)) => {
-                    let _ = reply.send(Ok(id));
+                    if reply.send(Ok(id)).is_err() {
+                        core.put_back_accepted(id);
+                    }
                 }
                 // Nothing pending: park until `Event::StreamOpened`.
-                Ok(None) => self.pending_accepts.push_back(reply),
+                Ok(None) => {
+                    if self.pending_accepts.len() >= MAX_PARKED_OPS {
+                        let _ = reply.send(Err(ConnError::Transport(
+                            "connection operation queue full".into(),
+                        )));
+                    } else {
+                        self.pending_accepts.push_back(reply);
+                    }
+                }
                 Err(e) => {
                     let _ = reply.send(Err(e));
                 }
             },
-            Cmd::Write { id, data, reply } => {
+            Cmd::Write {
+                id,
+                data,
+                reply,
+                started,
+                permit,
+            } => {
                 let mut pending = PendingWrite {
                     data,
                     offset: 0,
                     reply,
+                    started: false,
+                    call_started: started,
+                    _permit: permit,
                 };
+                if pending.reply.is_closed() {
+                    return;
+                }
                 if !Self::pump_write(core, id, &mut pending) {
                     self.blocked_writes.insert(id, pending);
                 }
             }
-            Cmd::Finish { id, reply } => {
-                let _ = reply.send(core.stream_finish(id));
+            Cmd::Finish {
+                id,
+                reply,
+                finished,
+                terminal,
+            } => {
+                self.send_terminals.insert(id, terminal.clone());
+                let result = core.stream_finish(id);
+                if result.is_ok() {
+                    finished.store(true, Ordering::Release);
+                } else {
+                    let mut slot = terminal.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(result.clone());
+                    }
+                }
+                let _ = reply.send(result);
             }
-            Cmd::WaitFinished { id, reply } => match core.send_fin(id) {
-                Some(SendFin::Acked) => {
-                    let _ = reply.send(Ok(()));
+            Cmd::WaitFinished {
+                id,
+                reply,
+                terminal,
+            } => {
+                let recorded = { terminal.lock().unwrap().clone() };
+                match recorded.or_else(|| match core.send_fin(id) {
+                    Some(SendFin::Acked) => Some(Ok(())),
+                    Some(SendFin::Stopped(code)) => Some(Err(ConnError::Stopped { code })),
+                    _ => None,
+                }) {
+                    Some(result) => {
+                        *terminal.lock().unwrap() = Some(result.clone());
+                        let _ = reply.send(result);
+                    }
+                    None => match core.send_fin(id) {
+                        Some(SendFin::Acked) => {
+                            let _ = reply.send(Ok(()));
+                        }
+                        Some(SendFin::Stopped(code)) => {
+                            let _ = reply.send(Err(ConnError::Stopped { code }));
+                        }
+                        Some(SendFin::Queued) => {
+                            self.fin_waiters.entry(id).or_default().push(reply)
+                        }
+                        Some(SendFin::Reset(_)) => {
+                            let _ = reply.send(Err(ConnError::ClosedStream));
+                        }
+                        Some(_) => {
+                            let _ = reply.send(Err(ConnError::ClosedStream));
+                        }
+                        None => {
+                            let _ = reply.send(Err(ConnError::ClosedStream));
+                        }
+                    },
                 }
-                Some(SendFin::Stopped(code)) => {
-                    let _ = reply.send(Err(ConnError::Stopped { code }));
-                }
-                Some(SendFin::Queued) => self.fin_waiters.entry(id).or_default().push(reply),
-                Some(_) => {
-                    let _ = reply.send(Err(ConnError::ClosedStream));
-                }
-                None => {
-                    let _ = reply.send(Err(ConnError::ClosedStream));
-                }
-            },
+            }
             Cmd::Reset { id, code, reply } => {
                 let result = core.stream_reset(id, code.into_inner());
-                if result.is_ok() {
+                if let Ok(outcome) = &result {
+                    if let Some(terminal) = self.send_terminals.get(&id) {
+                        let mut slot = terminal.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(match outcome {
+                                ResetOutcome::AlreadyAcknowledged => Ok(()),
+                                ResetOutcome::PeerStopped { code } => {
+                                    Err(ConnError::Stopped { code: *code })
+                                }
+                                _ => Err(ConnError::ClosedStream),
+                            });
+                        }
+                    }
                     self.fail_fin_waiters(id, ConnError::ClosedStream);
                     self.fail_blocked_write(id, ConnError::ClosedStream);
                 }
@@ -628,28 +1457,89 @@ impl Parked {
                 }
                 let _ = reply.send(result);
             }
-            Cmd::ReleaseSend { id } => {
-                core.forget_send(id);
-            }
-            Cmd::ReadToEnd { id, limit, reply } => {
+            Cmd::ReadToEnd {
+                id,
+                limit,
+                reply,
+                recovery,
+            } => {
+                let mut shared = recovery.lock().unwrap();
+                let shared_bytes = std::mem::take(&mut shared.bytes);
+                let shared_error = shared.error.take();
+                drop(shared);
+                if let Some(error) = shared_error {
+                    let _ = reply.send(Err(ReadToEndError {
+                        prefix: shared_bytes,
+                        error,
+                    }));
+                    return;
+                }
+                if let Some(error) = self.retained_read_errors.remove(&id) {
+                    let prefix = self.retained_reads.remove(&id).unwrap_or_default();
+                    let _ = reply.send(Err(ReadToEndError { prefix, error }));
+                    return;
+                }
+                if self
+                    .retained_reads
+                    .get(&id)
+                    .is_some_and(|b| b.len() > limit)
+                {
+                    let prefix = self.retained_reads.remove(&id).expect("checked above");
+                    let _ = core.stream_stop_auto(id, AUTO_STOP_READ_LIMIT);
+                    let _ = reply.send(Err(ReadToEndError {
+                        prefix,
+                        error: ConnError::ReadLimitExceeded { limit },
+                    }));
+                    return;
+                }
                 let mut pending = PendingRead {
-                    buf: Vec::new(),
+                    buf: shared_bytes,
                     end_limit: Some(limit),
                     max: None,
-                    reply,
+                    reply: Some(ReadReply::ToEnd(reply)),
+                    recovery,
                 };
-                if !Self::pump_read(core, id, &mut pending) {
+                if !self.pump_read(core, id, &mut pending) {
                     self.pending_reads.insert(id, pending);
                 }
             }
-            Cmd::Read { id, max, reply } => {
+            Cmd::Read {
+                id,
+                max,
+                reply,
+                recovery,
+            } => {
+                if let Some(mut retained) = self.retained_reads.remove(&id) {
+                    if !retained.is_empty() {
+                        let split = max.min(retained.len());
+                        let remainder = retained.split_off(split);
+                        if !remainder.is_empty() {
+                            self.retained_reads.insert(id, remainder);
+                        }
+                        if let Err(Ok(bytes)) = reply.send(Ok(retained)) {
+                            let mut restored = bytes;
+                            if let Some(mut tail) = self.retained_reads.remove(&id) {
+                                restored.append(&mut tail);
+                            }
+                            self.retained_reads.insert(id, restored);
+                        }
+                        return;
+                    }
+                }
+                if self.retained_reads.get(&id).is_none_or(Vec::is_empty) {
+                    if let Some(error) = self.retained_read_errors.remove(&id) {
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                }
                 let mut pending = PendingRead {
-                    buf: Vec::new(),
+                    buf: self.retained_reads.remove(&id).unwrap_or_default(),
                     end_limit: None,
                     max: Some(max.max(1)),
-                    reply,
+                    reply: Some(ReadReply::Chunk(reply)),
+                    recovery,
                 };
-                if !Self::pump_read(core, id, &mut pending) {
+                if !self.pump_read(core, id, &mut pending) {
                     self.pending_reads.insert(id, pending);
                 }
             }
@@ -678,7 +1568,9 @@ impl Parked {
             match core.accept_bi() {
                 Ok(Some(id)) => {
                     if let Some(reply) = self.pending_accepts.pop_front() {
-                        let _ = reply.send(Ok(id));
+                        if reply.send(Ok(id)).is_err() {
+                            core.put_back_accepted(id);
+                        }
                     }
                 }
                 Ok(None) => return,
@@ -697,7 +1589,7 @@ impl Parked {
         let Some(mut pending) = self.pending_reads.remove(&id) else {
             return;
         };
-        if !Self::pump_read(core, id, &mut pending) {
+        if !self.pump_read(core, id, &mut pending) {
             self.pending_reads.insert(id, pending);
         }
     }
@@ -714,6 +1606,12 @@ impl Parked {
 
     /// Complete a finish waiter when the peer acknowledges the stream's FIN.
     pub(crate) fn on_fin_acked(&mut self, id: StreamId) {
+        if let Some(terminal) = self.send_terminals.get(&id) {
+            let mut slot = terminal.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(Ok(()));
+            }
+        }
         if let Some(waiters) = self.fin_waiters.remove(&id) {
             for reply in waiters {
                 let _ = reply.send(Ok(()));
@@ -723,6 +1621,12 @@ impl Parked {
 
     /// Complete waiters and writes when the peer asks us to stop sending.
     pub(crate) fn on_stopped(&mut self, core: &mut CoreConn, id: StreamId, code: u64) {
+        if let Some(terminal) = self.send_terminals.get(&id) {
+            let mut slot = terminal.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(Err(ConnError::Stopped { code }));
+            }
+        }
         self.fail_fin_waiters(id, ConnError::Stopped { code });
         self.on_writable(core, id);
     }
@@ -732,18 +1636,39 @@ impl Parked {
     /// Called when the connection is lost, so awaiting handles wake with an
     /// error rather than hanging until their oneshot senders happen to drop.
     pub(crate) fn fail_all(&mut self) {
+        let error = self
+            .closed
+            .borrow()
+            .clone()
+            .map(|reason| ConnError::ConnectionLost { reason })
+            .unwrap_or(ConnError::Closed);
+        for reply in self.pending_opens.drain(..) {
+            let _ = reply.send(Err(error.clone()));
+        }
         for reply in self.pending_accepts.drain(..) {
-            let _ = reply.send(Err(ConnError::Closed));
+            let _ = reply.send(Err(error.clone()));
         }
         for (_, pending) in self.blocked_writes.drain() {
-            let _ = pending.reply.send(Err(ConnError::Closed));
+            let _ = pending.reply.send(Err(error.clone()));
         }
         for (_, pending) in self.pending_reads.drain() {
-            let _ = pending.reply.send(Err(ConnError::Closed));
+            if let Some(reply) = pending.reply {
+                if let Some((bytes, cause)) = reply.send_err(pending.buf, error.clone()) {
+                    let mut recovery = pending.recovery.lock().unwrap();
+                    recovery.bytes = bytes;
+                    recovery.error = Some(cause);
+                }
+            }
         }
         for (_, waiters) in self.fin_waiters.drain() {
             for reply in waiters {
-                let _ = reply.send(Err(ConnError::Closed));
+                let _ = reply.send(Err(error.clone()));
+            }
+        }
+        for terminal in self.send_terminals.values() {
+            let mut slot = terminal.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(Err(error.clone()));
             }
         }
     }
@@ -764,7 +1689,9 @@ impl Parked {
 
     fn fail_pending_read(&mut self, id: StreamId, err: ConnError) {
         if let Some(pending) = self.pending_reads.remove(&id) {
-            let _ = pending.reply.send(Err(err));
+            if let Some(reply) = pending.reply {
+                let _ = reply.send_err(pending.buf, err);
+            }
         }
     }
 
@@ -773,6 +1700,12 @@ impl Parked {
     /// been sent); false when it is still blocked and should stay parked.
     fn pump_write(core: &mut CoreConn, id: StreamId, pending: &mut PendingWrite) -> bool {
         loop {
+            if pending.reply.is_closed() {
+                if pending.started {
+                    let _ = core.stream_reset_auto(id, AUTO_RESET_CANCELLED_WRITE);
+                }
+                return true;
+            }
             if pending.offset >= pending.data.len() {
                 let reply = replace_reply_ok(&mut pending.reply);
                 let _ = reply.send(Ok(()));
@@ -782,7 +1715,11 @@ impl Parked {
                 // `stream_write` only reports `Wrote(0)` for an empty buffer,
                 // which the length check above has already excluded, so this
                 // always advances.
-                Ok(WriteOutcome::Wrote(n)) => pending.offset += n,
+                Ok(WriteOutcome::Wrote(n)) => {
+                    pending.started = true;
+                    pending.call_started.store(true, Ordering::Release);
+                    pending.offset += n;
+                }
                 Ok(WriteOutcome::Blocked) => return false,
                 Err(e) => {
                     let reply = replace_reply_ok(&mut pending.reply);
@@ -801,8 +1738,13 @@ impl Parked {
     /// `Read`/`Blocked`/`Finished` answer, and accumulating across `Blocked`s
     /// until `Finished` is what turns it back into the crate's one-shot
     /// `RecvStream::read_to_end` promise.
-    fn pump_read(core: &mut CoreConn, id: StreamId, pending: &mut PendingRead) -> bool {
+    fn pump_read(&mut self, core: &mut CoreConn, id: StreamId, pending: &mut PendingRead) -> bool {
+        let mut work = 0usize;
         loop {
+            if work >= READ_PASS_BUDGET {
+                self.needs_service = true;
+                return false;
+            }
             // Read straight into the tail of the accumulator, so a large
             // transfer costs no per-chunk allocation and no extra copy.
             let filled = pending.buf.len();
@@ -825,20 +1767,35 @@ impl Parked {
             let outcome = core.stream_read(id, &mut pending.buf[filled..]);
             match outcome {
                 Ok(ReadOutcome::Read(n)) => {
+                    work += n;
                     pending.buf.truncate(filled + n);
                     if pending
                         .end_limit
                         .is_some_and(|limit| pending.buf.len() > limit)
                     {
                         let limit = pending.end_limit.expect("checked above");
-                        let reply = replace_reply_read(&mut pending.reply);
-                        let _ = reply.send(Err(ConnError::ReadLimitExceeded { limit }));
+                        let mut prefix = std::mem::take(&mut pending.buf);
+                        prefix.truncate(limit);
+                        let _ = core.stream_stop_auto(id, AUTO_STOP_READ_LIMIT);
+                        if let Some((bytes, error)) = pending
+                            .reply
+                            .take()
+                            .expect("pending reply")
+                            .send_err(prefix, ConnError::ReadLimitExceeded { limit })
+                        {
+                            let mut recovery = pending.recovery.lock().unwrap();
+                            recovery.bytes = bytes;
+                            recovery.error = Some(error);
+                        }
                         return true;
                     }
                     if pending.max.is_some() {
                         let buf = std::mem::take(&mut pending.buf);
-                        let reply = replace_reply_read(&mut pending.reply);
-                        let _ = reply.send(Ok(buf));
+                        if let Some(bytes) =
+                            pending.reply.take().expect("pending reply").send_ok(buf)
+                        {
+                            pending.recovery.lock().unwrap().bytes = bytes;
+                        }
                         return true;
                     }
                 }
@@ -848,26 +1805,27 @@ impl Parked {
                 }
                 Ok(ReadOutcome::Finished) => {
                     pending.buf.truncate(filled);
-                    // The core keeps one `StreamId` per cleanly-finished stream
-                    // so a *repeat* read can answer `Finished` instead of
-                    // erroring. This layer has no repeat read to serve — the
-                    // `read_to_end` that owns this stream is completing right
-                    // now — so release it, which both bounds that set on a
-                    // connection carrying many short-lived streams and keeps
-                    // this crate's pre-core behaviour (a second `read_to_end`
-                    // on a drained stream is an error).
-                    if pending.end_limit.is_some() {
-                        core.forget_recv(id);
-                    }
                     let buf = std::mem::take(&mut pending.buf);
-                    let reply = replace_reply_read(&mut pending.reply);
-                    let _ = reply.send(Ok(buf));
+                    if let Some(bytes) = pending.reply.take().expect("pending reply").send_ok(buf) {
+                        let mut recovery = pending.recovery.lock().unwrap();
+                        recovery.bytes = bytes;
+                        recovery.eof = true;
+                    }
                     return true;
                 }
                 Err(e) => {
                     pending.buf.truncate(filled);
-                    let reply = replace_reply_read(&mut pending.reply);
-                    let _ = reply.send(Err(e));
+                    let prefix = std::mem::take(&mut pending.buf);
+                    if let Some((bytes, error)) = pending
+                        .reply
+                        .take()
+                        .expect("pending reply")
+                        .send_err(prefix, e)
+                    {
+                        let mut recovery = pending.recovery.lock().unwrap();
+                        recovery.bytes = bytes;
+                        recovery.error = Some(error);
+                    }
                     return true;
                 }
             }
@@ -885,9 +1843,30 @@ fn replace_reply_ok(
     std::mem::replace(slot, dead)
 }
 
-fn replace_reply_read(
-    slot: &mut oneshot::Sender<Result<Vec<u8>, ConnError>>,
-) -> oneshot::Sender<Result<Vec<u8>, ConnError>> {
-    let (dead, _) = oneshot::channel();
-    std::mem::replace(slot, dead)
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn completed_value_is_reclaimed_when_receiver_drops_before_poll() {
+        let reclaimed = Arc::new(AtomicUsize::new(0));
+        let seen = reclaimed.clone();
+        let (tx, rx) = handoff(
+            move |value: usize| {
+                seen.store(value, Ordering::SeqCst);
+            },
+            || {},
+        );
+        tx.send(41).unwrap();
+        drop(rx);
+        assert_eq!(reclaimed.load(Ordering::SeqCst), 41);
+    }
+
+    #[tokio::test]
+    async fn sender_drop_wakes_receiver() {
+        let (tx, rx) = handoff(|_: usize| {}, || {});
+        drop(tx);
+        assert_eq!(rx.receive().await, None);
+    }
 }

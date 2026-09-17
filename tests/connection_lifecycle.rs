@@ -55,7 +55,7 @@ async fn server_side_close_is_reaped_across_many_cycles() {
 
     // ONE long-lived server, reused across every cycle — this is what exposed the
     // handle-reuse collision.
-    let mut server = Server::bind(secrets).await.unwrap();
+    let server = Server::bind(secrets).await.unwrap();
     let addr = server.local_addr();
 
     for cycle in 0..CYCLES {

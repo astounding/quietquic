@@ -120,7 +120,16 @@ pub enum ConnectionError {
     VersionMismatch,
     #[error("connection IDs exhausted")]
     CidsExhausted,
+    #[error("endpoint failed: {message}")]
+    EndpointFailed {
+        message: String,
+        raw_os_error: Option<i32>,
+    },
 }
+
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+#[error("connection handle is stale or belongs to another endpoint")]
+pub struct ConnectionHandleError;
 
 impl ConnectionError {
     pub(crate) fn from_quinn(reason: quinn_proto::ConnectionError) -> Self {

@@ -68,22 +68,27 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use quinn_proto::{
     ClientConfig as TransportClientConfig, ConnectionHandle as QuinnConnectionHandle, ConnectionId,
-    DatagramEvent, EndpointConfig, ServerConfig as TransportServerConfig, TransportConfig, VarInt,
+    DatagramEvent, EndpointConfig as QuinnEndpointConfig, ServerConfig as TransportServerConfig,
+    VarInt,
 };
 
-use crate::config::{ClientConfigFile, ConfigError, Psk, ServerSecrets};
+use crate::config::{
+    ClientConfigFile, ConfigError, EndpointConfig, Psk, ServerSecrets, TransportSettings,
+};
 use crate::conn::ConnState;
 use crate::crypto::{
     quic_client_config, random_bytes, reset_key, token_key, RecordingCidGenerator, SelfSigned,
 };
 use crate::freshness::{is_fresh, now_minutes, WINDOW_MINUTES};
 use crate::initial_keys::{PskClientConfig, PskServerConfig};
-use crate::outcome::{ConnectionError, ConnectionHandle, DatagramOutcome, Event, Transmit};
+use crate::outcome::{
+    ConnectionError, ConnectionHandle, ConnectionHandleError, DatagramOutcome, Event, Transmit,
+};
 use crate::ratelimit::RateLimiter;
 use crate::replay::ReplayGuard;
 use crate::selector::{build_dcid, parse_dcid, selector_matches, DcidParts, DCID_LEN};
@@ -117,10 +122,13 @@ struct ClientCrypto {
 }
 
 /// Build one PSK-rekeyed transport `ServerConfig` per authorized client.
-fn build_clients(secrets: &ServerSecrets) -> Result<Vec<ClientCrypto>, ConfigError> {
+fn build_clients(
+    entries: &[crate::config::ClientEntry],
+    transport: &TransportSettings,
+) -> Result<Vec<ClientCrypto>, ConfigError> {
     let mut client_ids = HashSet::new();
     let mut psks = HashSet::new();
-    for entry in &secrets.clients {
+    for entry in entries {
         if entry.client_id.trim().is_empty() {
             return Err(ConfigError::Invalid("client_id must not be empty".into()));
         }
@@ -149,12 +157,12 @@ fn build_clients(secrets: &ServerSecrets) -> Result<Vec<ClientCrypto>, ConfigErr
 
     let token_key = token_key();
 
-    let mut clients = Vec::with_capacity(secrets.clients.len());
-    for entry in &secrets.clients {
+    let mut clients = Vec::with_capacity(entries.len());
+    for entry in entries {
         let psk = *entry.psk.as_bytes();
         let crypto = Arc::new(PskServerConfig::new(quic_server.clone(), psk));
         let mut server_config = TransportServerConfig::new(crypto, token_key.clone());
-        server_config.transport_config(quietquic_transport_config());
+        server_config.transport_config(transport.arc());
         let server_config = Arc::new(server_config);
         clients.push(ClientCrypto {
             client_id: entry.client_id.clone(),
@@ -163,12 +171,6 @@ fn build_clients(secrets: &ServerSecrets) -> Result<Vec<ClientCrypto>, ConfigErr
         });
     }
     Ok(clients)
-}
-
-fn quietquic_transport_config() -> Arc<TransportConfig> {
-    let mut transport = TransportConfig::default();
-    transport.max_concurrent_uni_streams(VarInt::from_u32(0));
-    Arc::new(transport)
 }
 
 /// An `EndpointConfig` whose CID generator records every CID it mints.
@@ -182,8 +184,8 @@ fn quietquic_transport_config() -> Arc<TransportConfig> {
 fn recording_endpoint_config(
     issued: &Arc<Mutex<HashSet<ConnectionId>>>,
     pending: &Arc<Mutex<Vec<ConnectionId>>>,
-) -> EndpointConfig {
-    let mut endpoint_config = EndpointConfig::new(Arc::new(reset_key()));
+) -> QuinnEndpointConfig {
+    let mut endpoint_config = QuinnEndpointConfig::new(Arc::new(reset_key()));
     let recorder = issued.clone();
     let pending = pending.clone();
     endpoint_config.cid_generator(move || {
@@ -200,6 +202,16 @@ fn recording_endpoint_config(
 pub struct Endpoint {
     inner: quinn_proto::Endpoint,
     role: Role,
+    config: EndpointConfig,
+    admission_paused: bool,
+    pending_incoming: HashMap<ConnectionHandle, Instant>,
+    handshake_deadlines: HashMap<ConnectionHandle, Instant>,
+    loss_overrides: HashMap<ConnectionHandle, ConnectionError>,
+    cleanup_deadlines: HashMap<ConnectionHandle, Instant>,
+    terminal_connections: HashMap<ConnectionHandle, ConnectionError>,
+    service_cursor: usize,
+    needs_service: bool,
+    terminal: Option<ConnectionError>,
     /// Authorized clients. Empty for [`Role::Client`].
     clients: Vec<ClientCrypto>,
     /// Per-client anti-replay guards (index-aligned with `clients`).
@@ -246,27 +258,36 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    /// Build a server endpoint from parsed secrets.
-    pub fn new_server(secrets: ServerSecrets) -> Result<Self, ConfigError> {
-        let clients = build_clients(&secrets)?;
-
-        let issued_cids: Arc<Mutex<HashSet<ConnectionId>>> = Arc::new(Mutex::new(HashSet::new()));
-        let pending_cids: Arc<Mutex<Vec<ConnectionId>>> = Arc::new(Mutex::new(Vec::new()));
+    /// Build an endpoint without initiating a connection.
+    pub fn new(config: EndpointConfig) -> Result<Self, ConfigError> {
+        config.validate()?;
+        let clients = build_clients(&config.credentials, &config.transport)?;
+        let issued_cids = Arc::new(Mutex::new(HashSet::new()));
+        let pending_cids = Arc::new(Mutex::new(Vec::new()));
         let endpoint_config = recording_endpoint_config(&issued_cids, &pending_cids);
-
-        // Starts with no server config; the correct per-PSK `ServerConfig` is
-        // installed by the pre-filter right before an admitted Initial reaches
-        // `handle`.
         let inner = quinn_proto::Endpoint::new(Arc::new(endpoint_config), None, true, None);
-
         let replay = clients
             .iter()
             .map(|_| ReplayGuard::new(WINDOW_MINUTES))
             .collect();
-
+        let role = if config.capability.can_accept() {
+            Role::Server
+        } else {
+            Role::Client
+        };
         Ok(Self {
             inner,
-            role: Role::Server,
+            role,
+            config,
+            admission_paused: false,
+            pending_incoming: HashMap::new(),
+            handshake_deadlines: HashMap::new(),
+            loss_overrides: HashMap::new(),
+            service_cursor: 0,
+            cleanup_deadlines: HashMap::new(),
+            terminal_connections: HashMap::new(),
+            needs_service: false,
+            terminal: None,
             clients,
             replay,
             rate_limiter: RateLimiter::new(),
@@ -282,6 +303,69 @@ impl Endpoint {
             next_timeout: None,
             last_service: None,
         })
+    }
+
+    /// Start another outgoing connection on this endpoint.
+    pub fn connect(
+        &mut self,
+        now: Instant,
+        freshness_minute: u32,
+        cfg: ClientConfigFile,
+        transport_override: Option<TransportSettings>,
+        handshake_timeout_override: Option<Duration>,
+    ) -> Result<ConnectionHandle, ConfigError> {
+        if !self.config.capability.can_dial() {
+            return Err(ConfigError::Invalid(
+                "endpoint does not have dial capability".into(),
+            ));
+        }
+        if self.terminal.is_some() {
+            return Err(ConfigError::Invalid("endpoint is closed".into()));
+        }
+        let timeout = handshake_timeout_override.unwrap_or(self.config.outgoing_handshake_timeout);
+        if timeout.is_zero() {
+            return Err(ConfigError::Invalid(
+                "outgoing handshake timeout must be finite and positive".into(),
+            ));
+        }
+        if timeout > crate::config::MAX_ENDPOINT_DURATION {
+            return Err(ConfigError::Invalid(
+                "outgoing handshake timeout exceeds the 24 hour maximum".into(),
+            ));
+        }
+        let handshake_deadline = deadline(now, timeout)?;
+        let psk = *cfg.psk.as_bytes();
+        let dcid = build_dcid(&psk, random_bytes::<8>(), freshness_minute);
+        let crypto = quic_client_config()
+            .map_err(|e| ConfigError::Io(std::io::Error::other(format!("client crypto: {e}"))))?;
+        let mut config = TransportClientConfig::new(Arc::new(PskClientConfig::new(crypto, psk)));
+        config.transport_config(
+            transport_override
+                .unwrap_or_else(|| self.config.transport.clone())
+                .arc(),
+        );
+        config.initial_dst_cid_provider(Arc::new(move || ConnectionId::new(&dcid)));
+        let (quinn_ch, conn) = match self.inner.connect(now, config, cfg.server, SERVER_NAME) {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.sweep_orphan_cids();
+                return Err(ConfigError::Io(std::io::Error::other(format!(
+                    "connect: {error}"
+                ))));
+            }
+        };
+        let ch = self.allocate_handle(quinn_ch);
+        self.drain_pending_cids(ch);
+        self.connections.insert(ch, ConnState::new(conn));
+        self.handshake_deadlines.insert(ch, handshake_deadline);
+        self.last_service = Some(now);
+        self.refresh_next_timeout();
+        Ok(ch)
+    }
+
+    /// Build a server endpoint from parsed secrets.
+    pub fn new_server(secrets: ServerSecrets) -> Result<Self, ConfigError> {
+        Self::new(EndpointConfig::accept(secrets.clients))
     }
 
     /// Build a client endpoint and start dialing the server named in `cfg`.
@@ -326,62 +410,8 @@ impl Endpoint {
         freshness_minute: u32,
         cfg: ClientConfigFile,
     ) -> Result<(Self, ConnectionHandle), ConfigError> {
-        let psk = *cfg.psk.as_bytes();
-        let server_addr = cfg.server;
-
-        // 1. The blinded selector DCID: a random nonce + the caller-supplied
-        //    coarse minute, keyed by the PSK.
-        let nonce = random_bytes::<8>();
-        let dcid = build_dcid(&psk, nonce, freshness_minute);
-
-        // 2. Client crypto: stock TLS 1.3 (cert verification skipped — the PSK
-        //    authenticates), wrapped to re-key the Initial packet from the PSK.
-        let quic_client = quic_client_config()
-            .map_err(|e| ConfigError::Io(std::io::Error::other(format!("client crypto: {e}"))))?;
-        let psk_client = Arc::new(PskClientConfig::new(quic_client, psk));
-        let mut client_config = TransportClientConfig::new(psk_client);
-        client_config.transport_config(quietquic_transport_config());
-
-        // 3. Force the first-flight DCID to the selector.
-        client_config.initial_dst_cid_provider(Arc::new(move || ConnectionId::new(&dcid)));
-
-        let issued_cids: Arc<Mutex<HashSet<ConnectionId>>> = Arc::new(Mutex::new(HashSet::new()));
-        let pending_cids: Arc<Mutex<Vec<ConnectionId>>> = Arc::new(Mutex::new(Vec::new()));
-        let endpoint_config = recording_endpoint_config(&issued_cids, &pending_cids);
-
-        // A client endpoint has no server config: it never accepts.
-        let mut inner = quinn_proto::Endpoint::new(Arc::new(endpoint_config), None, true, None);
-        let (quinn_ch, conn) = inner
-            .connect(now, client_config, server_addr, SERVER_NAME)
-            .map_err(|e| ConfigError::Io(std::io::Error::other(format!("connect: {e}"))))?;
-
-        let mut endpoint = Self {
-            inner,
-            role: Role::Client,
-            clients: Vec::new(),
-            replay: Vec::new(),
-            rate_limiter: RateLimiter::new(),
-            issued_cids,
-            pending_cids,
-            cids_by_conn: HashMap::new(),
-            connections: HashMap::new(),
-            client_ids: HashMap::new(),
-            by_quinn: HashMap::new(),
-            next_generation: 1,
-            outbound: VecDeque::new(),
-            events: VecDeque::new(),
-            next_timeout: None,
-            // The dial instant doubles as the first "already elapsed" deadline,
-            // so `next_timeout()` has one to report if the caller does stream
-            // work before the first servicing pass.
-            last_service: Some(now),
-        };
-        // `connect` minted this connection's initial local CID via the recorder;
-        // attribute it to `ch` so it is pruned when the connection is lost.
-        let ch = endpoint.allocate_handle(quinn_ch);
-        endpoint.drain_pending_cids(ch);
-        endpoint.connections.insert(ch, ConnState::new(conn));
-        endpoint.refresh_next_timeout();
+        let mut endpoint = Self::new(EndpointConfig::dial())?;
+        let ch = endpoint.connect(now, freshness_minute, cfg, None, None)?;
         Ok((endpoint, ch))
     }
 
@@ -402,8 +432,17 @@ impl Endpoint {
         from: SocketAddr,
         data: &[u8],
     ) -> DatagramOutcome {
+        if self.terminal.is_some() {
+            return DatagramOutcome::Dropped;
+        }
         let mut admitted_client = None;
         if self.role == Role::Server && !self.is_active_dcid(data) {
+            if self.admission_paused
+                || !self.config.capability.can_accept()
+                || self.pending_incoming.len() >= self.config.max_pending_incoming
+            {
+                return DatagramOutcome::Dropped;
+            }
             // NEW-CONNECTION ATTEMPT: run the silence pre-filter.
             //
             // The rate limiter is consulted BEFORE any selector/MAC work, so a
@@ -479,7 +518,7 @@ impl Endpoint {
     /// elapsed deadline is reported at most until the next
     /// `poll_transmit`-to-`None`.
     pub fn next_timeout(&self) -> Option<Instant> {
-        if self.connections.values().any(ConnState::is_dirty) {
+        if self.needs_service || self.connections.values().any(ConnState::is_dirty) {
             // `last_service` is an instant the caller itself handed us on an
             // earlier pass, so on a monotonic clock it is necessarily <= "now".
             // It is always `Some` whenever a connection exists (set by the dial
@@ -489,8 +528,41 @@ impl Endpoint {
         self.next_timeout
     }
 
+    /// Earliest transport/handshake/cleanup timer, excluding deferred local work.
+    ///
+    /// A socket driver whose own send queue is full can use this deadline to
+    /// avoid spinning on [`Endpoint::next_timeout`]'s immediate work wakeup
+    /// while still servicing protocol timers.
+    pub fn next_protocol_timeout(&self) -> Option<Instant> {
+        self.next_timeout
+    }
+
     /// Advance every connection whose timer has expired, then service.
     pub fn handle_timeout(&mut self, now: Instant) {
+        let expired: Vec<_> = self
+            .handshake_deadlines
+            .iter()
+            .filter_map(|(ch, at)| (*at <= now).then_some(*ch))
+            .collect();
+        for ch in expired {
+            self.loss_overrides.insert(ch, ConnectionError::TimedOut);
+            self.handshake_deadlines.remove(&ch);
+            let _ = self.close_connection(now, ch, VarInt::from_u32(0), Vec::new());
+        }
+        let cleanup_expired: Vec<_> = self
+            .cleanup_deadlines
+            .iter()
+            .filter_map(|(ch, at)| (*at <= now).then_some(*ch))
+            .collect();
+        for ch in cleanup_expired {
+            let reason = self
+                .terminal_connections
+                .get(&ch)
+                .cloned()
+                .or_else(|| self.loss_overrides.get(&ch).cloned())
+                .unwrap_or(ConnectionError::LocallyClosed);
+            let _ = self.force_remove(now, ch, reason);
+        }
         for state in self.connections.values_mut() {
             if state.conn_mut().poll_timeout().is_some_and(|t| t <= now) {
                 state.conn_mut().handle_timeout(now);
@@ -509,7 +581,178 @@ impl Endpoint {
     /// handle always returns `None`, even if Quinn has reused its internal slab
     /// slot for a later connection.
     pub fn conn_mut(&mut self, ch: ConnectionHandle) -> Option<&mut ConnState> {
+        if self.terminal_connections.contains_key(&ch) {
+            return None;
+        }
         self.connections.get_mut(&ch)
+    }
+
+    pub fn config(&self) -> &EndpointConfig {
+        &self.config
+    }
+
+    pub fn set_transport_defaults(&mut self, transport: TransportSettings) {
+        for client in &mut self.clients {
+            let mut server = (*client.server_config).clone();
+            server.transport_config(transport.arc());
+            client.server_config = Arc::new(server);
+        }
+        self.config.transport = transport;
+    }
+
+    pub fn pause_admission(&mut self) {
+        self.admission_paused = true;
+    }
+
+    pub fn resume_admission(&mut self) {
+        self.admission_paused = false;
+    }
+
+    pub fn admission_paused(&self) -> bool {
+        self.admission_paused
+    }
+
+    /// Number of inbound handshakes/connections still occupying admission slots.
+    pub fn pending_incoming_count(&self) -> usize {
+        self.pending_incoming.len()
+    }
+
+    pub fn mark_accepted(&mut self, ch: ConnectionHandle) -> Result<(), ConnectionHandleError> {
+        if !self.connections.contains_key(&ch) || self.terminal_connections.contains_key(&ch) {
+            return Err(ConnectionHandleError);
+        }
+        self.pending_incoming.remove(&ch);
+        Ok(())
+    }
+
+    /// Close inbound connections that have not crossed the application handoff point.
+    pub fn close_pending_incoming(&mut self, now: Instant) {
+        let handles: Vec<_> = self.pending_incoming.keys().copied().collect();
+        for ch in handles {
+            let _ = self.close_connection(now, ch, VarInt::from_u32(0), Vec::new());
+        }
+    }
+
+    pub fn connections(&self) -> impl Iterator<Item = ConnectionHandle> + '_ {
+        self.connections
+            .keys()
+            .filter(|ch| !self.terminal_connections.contains_key(ch))
+            .copied()
+    }
+
+    /// True only after all live and terminal transport state has been drained.
+    pub fn is_idle(&self) -> bool {
+        self.connections.is_empty()
+    }
+
+    /// Internal cleanup work still retaining Quinn endpoint state.
+    pub fn cleanup_handles(&self) -> impl Iterator<Item = ConnectionHandle> + '_ {
+        self.terminal_connections.keys().copied()
+    }
+
+    pub fn endpoint_error(&self) -> Option<&ConnectionError> {
+        self.terminal.as_ref()
+    }
+
+    /// Begin terminal graceful shutdown of every connection.
+    ///
+    /// Application-visible loss is immediate. Transport state remains retained
+    /// until Quinn drains it or the configured cleanup deadline is forced.
+    pub fn close(&mut self, now: Instant) {
+        if self.terminal.is_some() {
+            return;
+        }
+        self.terminal = Some(ConnectionError::LocallyClosed);
+        let handles: Vec<_> = self.connections.keys().copied().collect();
+        for ch in handles {
+            let _ = self.close_connection(now, ch, VarInt::from_u32(0), Vec::new());
+        }
+        self.admission_paused = true;
+        self.refresh_next_timeout();
+    }
+
+    /// Record a terminal endpoint failure and begin bounded transport cleanup.
+    pub fn fail(&mut self, now: Instant, message: impl Into<String>, raw_os_error: Option<i32>) {
+        if self.terminal.is_some() {
+            return;
+        }
+        let reason = ConnectionError::EndpointFailed {
+            message: message.into(),
+            raw_os_error,
+        };
+        self.terminal = Some(reason.clone());
+        let handles: Vec<_> = self.connections.keys().copied().collect();
+        for ch in handles {
+            if let Some(state) = self.connections.get_mut(&ch) {
+                state
+                    .conn_mut()
+                    .close(now, VarInt::from_u32(0), bytes::Bytes::new());
+            }
+            self.mark_terminal(ch, reason.clone(), now);
+        }
+        self.admission_paused = true;
+        self.refresh_next_timeout();
+    }
+
+    pub fn close_connection(
+        &mut self,
+        now: Instant,
+        ch: ConnectionHandle,
+        code: VarInt,
+        reason: Vec<u8>,
+    ) -> Result<(), ConnectionHandleError> {
+        let state = self.connections.get_mut(&ch).ok_or(ConnectionHandleError)?;
+        state.conn_mut().close(now, code, reason.into());
+        self.handshake_deadlines.remove(&ch);
+        let reason = self
+            .loss_overrides
+            .remove(&ch)
+            .unwrap_or(ConnectionError::LocallyClosed);
+        self.mark_terminal(ch, reason, now);
+        self.service_connections(now);
+        Ok(())
+    }
+
+    /// Finish transport cleanup for one connection without advancing siblings' clocks.
+    pub fn force_remove(
+        &mut self,
+        now: Instant,
+        ch: ConnectionHandle,
+        reason: ConnectionError,
+    ) -> Result<(), ConnectionHandleError> {
+        if !self.connections.contains_key(&ch) {
+            return Err(ConnectionHandleError);
+        }
+        if let Some(state) = self.connections.get_mut(&ch) {
+            state
+                .conn_mut()
+                .close(now, VarInt::from_u32(0), bytes::Bytes::new());
+        }
+        for _ in 0..64 {
+            let Some(state) = self.connections.get_mut(&ch) else {
+                break;
+            };
+            let Some(t) = state.conn_mut().poll_timeout() else {
+                break;
+            };
+            state.conn_mut().handle_timeout(t);
+            while let Some(ev) = state.conn_mut().poll_endpoint_events() {
+                let cev = self.inner.handle_event(ch.quinn, ev);
+                if let Some(cev) = cev {
+                    state.conn_mut().handle_event(cev);
+                }
+            }
+            if state.is_drained() {
+                break;
+            }
+        }
+        debug_assert!(
+            self.connections.get(&ch).is_some_and(ConnState::is_drained),
+            "forced cleanup did not drain Quinn state"
+        );
+        self.remove_connection(ch, reason);
+        self.refresh_next_timeout();
+        Ok(())
     }
 
     /// Authenticated server-side client identity for a live connection.
@@ -600,7 +843,10 @@ impl Endpoint {
         // prober could confirm "something QUIC-ish lives here" by eliciting a
         // reply. A client has nothing legitimate to say at the endpoint level,
         // so it says nothing.
-        if !resp.is_empty() && self.role == Role::Server {
+        if !resp.is_empty()
+            && self.role == Role::Server
+            && self.outbound.len() < self.config.max_outbound_datagrams
+        {
             self.outbound.push_back(Transmit {
                 destination: from,
                 contents: resp,
@@ -660,11 +906,14 @@ impl Endpoint {
         incoming: quinn_proto::Incoming,
         client_idx: usize,
     ) -> DatagramOutcome {
+        let Ok(handshake_deadline) = deadline(now, self.config.incoming_handshake_timeout) else {
+            return DatagramOutcome::Dropped;
+        };
         let mut buf = Vec::new();
         match self.inner.accept(incoming, now, &mut buf, None) {
             Ok((quinn_ch, conn)) => {
                 let ch = self.allocate_handle(quinn_ch);
-                if !buf.is_empty() {
+                if !buf.is_empty() && self.outbound.len() < self.config.max_outbound_datagrams {
                     self.outbound.push_back(Transmit {
                         destination: conn.remote_address(),
                         contents: buf,
@@ -674,6 +923,8 @@ impl Endpoint {
                 // recorder; attribute them to `ch` for later pruning.
                 self.drain_pending_cids(ch);
                 self.connections.insert(ch, ConnState::new(conn));
+                self.pending_incoming.insert(ch, handshake_deadline);
+                self.handshake_deadlines.insert(ch, handshake_deadline);
                 self.client_ids
                     .insert(ch, self.clients[client_idx].client_id.clone());
                 DatagramOutcome::Accepted(ch)
@@ -719,19 +970,31 @@ impl Endpoint {
         // for a dirty connection. Recorded up front so it is correct even if
         // this pass reaps everything.
         self.last_service = Some(now);
+        self.needs_service = false;
 
-        let handles: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
+        let mut handles: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
+        handles.sort_by_key(|ch| ch.generation());
+        if !handles.is_empty() {
+            let start = self.service_cursor % handles.len();
+            handles.rotate_left(start);
+            self.service_cursor = (start + 1) % handles.len();
+        }
 
         // 1. Route connection→endpoint events (which may mint or retire CIDs).
         //    Any CID minted by `handle_event` — a `NeedIdentifiers`-triggered
         //    reissue for this connection — is attributed to `ch` via the pending
         //    queue, immediately, while we still know who asked for it.
         for ch in &handles {
-            while let Some(ev) = self
-                .connections
-                .get_mut(ch)
-                .and_then(|s| s.conn_mut().poll_endpoint_events())
-            {
+            let mut work = 0;
+            for _ in 0..self.config.max_connection_work {
+                let Some(ev) = self
+                    .connections
+                    .get_mut(ch)
+                    .and_then(|s| s.conn_mut().poll_endpoint_events())
+                else {
+                    break;
+                };
+                work += 1;
                 let cev = self.inner.handle_event(ch.quinn, ev);
                 self.drain_pending_cids(*ch);
                 if let Some(cev) = cev {
@@ -740,13 +1003,18 @@ impl Endpoint {
                     }
                 }
             }
+            if work == self.config.max_connection_work {
+                self.needs_service = true;
+            }
         }
 
         // 2. Service application events and collect transmits. Staged into
         //    locals because `self.connections` is borrowed for the whole loop.
         let mut events: Vec<Event> = Vec::new();
         let mut transmits: Vec<Transmit> = Vec::new();
-        let mut lost: Vec<(ConnectionHandle, ConnectionError)> = Vec::new();
+        let mut observed_lost: Vec<(ConnectionHandle, ConnectionError)> = Vec::new();
+        let mut drained: Vec<ConnectionHandle> = Vec::new();
+        let mut connected: Vec<ConnectionHandle> = Vec::new();
 
         for ch in &handles {
             let Some(state) = self.connections.get_mut(ch) else {
@@ -754,9 +1022,13 @@ impl Endpoint {
             };
 
             // `service_streams` is the SOLE `conn.poll()` caller.
-            let progress = state.service_streams();
+            let progress = state.service_streams(self.config.max_connection_work);
+            if progress.more_work {
+                self.needs_service = true;
+            }
             if progress.connected {
                 events.push(Event::Connected(*ch));
+                connected.push(*ch);
             }
             for id in progress.opened {
                 events.push(Event::StreamOpened {
@@ -801,15 +1073,25 @@ impl Endpoint {
             // `a_locally_closed_connection_is_reaped_and_reports_connection_lost`
             // in `proto/tests/core_endpoint.rs`.
             if let Some(reason) = progress.lost {
-                lost.push((*ch, reason));
-            } else if state.is_drained() {
-                lost.push((*ch, ConnectionError::LocallyClosed));
+                observed_lost.push((*ch, reason));
+            }
+            if state.is_drained() {
+                drained.push(*ch);
             }
 
             // Drain outbound datagrams. One datagram per `poll_transmit`
             // (`max_datagrams = 1`), so `buf` holds exactly one each time.
             let mut buf = Vec::new();
-            while let Some(t) = state.conn_mut().poll_transmit(now, 1, &mut buf) {
+            let mut work = 0;
+            for _ in 0..self.config.max_connection_work {
+                if self.outbound.len() + transmits.len() >= self.config.max_outbound_datagrams {
+                    self.needs_service = true;
+                    break;
+                }
+                let Some(t) = state.conn_mut().poll_transmit(now, 1, &mut buf) else {
+                    break;
+                };
+                work += 1;
                 if buf.is_empty() {
                     break;
                 }
@@ -818,33 +1100,40 @@ impl Endpoint {
                     contents: std::mem::take(&mut buf),
                 });
             }
+            if work == self.config.max_connection_work {
+                self.needs_service = true;
+            }
 
             // Everything the caller's stream operations produced — bytes, FIN,
             // RESET_STREAM, STOP_SENDING, and the MAX_STREAM_DATA/MAX_DATA
             // credit a read released — is now in `transmits`. The connection is
             // clean until the caller touches a stream again.
-            state.clear_dirty();
+            if work < self.config.max_connection_work {
+                state.clear_dirty();
+            }
         }
 
+        for ch in connected {
+            self.handshake_deadlines.remove(&ch);
+        }
         self.events.extend(events);
         self.outbound.extend(transmits);
 
-        // 3. Reap. This happens AFTER the transmit drain above, so a closing
+        for (ch, reason) in observed_lost {
+            let reason = self.loss_overrides.remove(&ch).unwrap_or(reason);
+            self.mark_terminal(ch, reason, now);
+        }
+
+        // 3. Reap only after Quinn has delivered its Drained endpoint event.
         //    connection's CONNECTION_CLOSE is already queued for the caller.
-        for (ch, reason) in lost {
-            if self.connections.remove(&ch).is_some() {
-                self.by_quinn.remove(&ch.quinn);
-                self.client_ids.remove(&ch);
-                // The only place a CID leaves the routing set, and it runs
-                // strictly after the connection is gone, so no live CID is ever
-                // removed.
-                self.prune_connection_cids(ch);
-                // Emitted for BOTH loss paths, including a self-close that
-                // quinn-proto never reported: from the caller's point of view
-                // the handle is dead either way, and this is how it finds out.
-                self.events
-                    .push_back(Event::ConnectionLost { conn: ch, reason });
-            }
+        for ch in drained {
+            let reason = self
+                .terminal_connections
+                .get(&ch)
+                .cloned()
+                .or_else(|| self.loss_overrides.remove(&ch))
+                .unwrap_or(ConnectionError::LocallyClosed);
+            self.remove_connection(ch, reason);
         }
 
         // 4. Backstop. Every mint site above is followed immediately by its own
@@ -864,7 +1153,42 @@ impl Endpoint {
             .connections
             .values_mut()
             .filter_map(|s| s.conn_mut().poll_timeout())
+            .chain(self.handshake_deadlines.values().copied())
+            .chain(self.cleanup_deadlines.values().copied())
             .min();
+    }
+
+    fn remove_connection(&mut self, ch: ConnectionHandle, reason: ConnectionError) {
+        if self.connections.remove(&ch).is_some() {
+            self.by_quinn.remove(&ch.quinn);
+            self.client_ids.remove(&ch);
+            self.pending_incoming.remove(&ch);
+            self.handshake_deadlines.remove(&ch);
+            self.loss_overrides.remove(&ch);
+            self.cleanup_deadlines.remove(&ch);
+            self.prune_connection_cids(ch);
+            if self.terminal_connections.remove(&ch).is_none() {
+                self.events
+                    .push_back(Event::ConnectionLost { conn: ch, reason });
+            }
+        }
+    }
+
+    fn mark_terminal(&mut self, ch: ConnectionHandle, reason: ConnectionError, now: Instant) {
+        if !self.connections.contains_key(&ch) {
+            return;
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.terminal_connections.entry(ch)
+        {
+            entry.insert(reason.clone());
+            self.events
+                .push_back(Event::ConnectionLost { conn: ch, reason });
+        }
+        self.pending_incoming.remove(&ch);
+        self.handshake_deadlines.remove(&ch);
+        let cleanup = now.checked_add(self.config.cleanup_timeout).unwrap_or(now);
+        self.cleanup_deadlines.entry(ch).or_insert(cleanup);
     }
 
     /// Move every CID the recorder minted since the last drain into `ch`'s
@@ -947,6 +1271,11 @@ fn read_dcid_any(data: &[u8]) -> Option<&[u8]> {
     }
 }
 
+fn deadline(now: Instant, timeout: Duration) -> Result<Instant, ConfigError> {
+    now.checked_add(timeout)
+        .ok_or_else(|| ConfigError::Invalid("deadline exceeds monotonic clock range".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -956,9 +1285,7 @@ mod tests {
     /// A server endpoint with no authorized clients: enough to exercise the CID
     /// bookkeeping without a handshake.
     fn bare_server() -> Endpoint {
-        let secrets: ServerSecrets =
-            toml::from_str("listen = \"127.0.0.1:0\"\nclients = []\n").expect("parse secrets");
-        Endpoint::new_server(secrets).expect("server endpoint")
+        Endpoint::new(EndpointConfig::dial()).expect("endpoint")
     }
 
     #[test]
@@ -984,6 +1311,49 @@ mod tests {
             Endpoint::new_server(duplicate_psk),
             Err(ConfigError::Invalid(message)) if message.contains("duplicate PSK")
         ));
+    }
+
+    #[test]
+    fn admission_pause_is_reversible_but_capability_is_fixed() {
+        let mut ep = bare_server();
+        assert_eq!(ep.config().capability, crate::config::Capability::Dial);
+        assert!(!ep.admission_paused());
+        ep.pause_admission();
+        assert!(ep.admission_paused());
+        ep.resume_admission();
+        assert!(!ep.admission_paused());
+        assert_eq!(ep.config().capability, crate::config::Capability::Dial);
+    }
+
+    #[test]
+    fn dial_is_rejected_without_capability() {
+        let secrets: ServerSecrets = toml::from_str(
+            "listen=\"127.0.0.1:0\"\n[[clients]]\nclient_id=\"a\"\npsk=\"0000000000000000000000000000000000000000000000000000000000000001\"\n",
+        )
+        .unwrap();
+        let client: ClientConfigFile = toml::from_str(
+            "client_id=\"a\"\npsk=\"0000000000000000000000000000000000000000000000000000000000000001\"\nserver=\"127.0.0.1:443\"\n",
+        )
+        .unwrap();
+        let mut ep = Endpoint::new_server(secrets).unwrap();
+        assert!(matches!(
+            ep.connect(Instant::now(), 0, client, None, None),
+            Err(ConfigError::Invalid(message)) if message.contains("dial capability")
+        ));
+    }
+
+    #[test]
+    fn transport_default_update_rebuilds_future_incoming_snapshots() {
+        let secrets: ServerSecrets = toml::from_str(
+            "listen=\"127.0.0.1:0\"\n[[clients]]\nclient_id=\"a\"\npsk=\"0000000000000000000000000000000000000000000000000000000000000001\"\n",
+        )
+        .unwrap();
+        let mut endpoint = Endpoint::new_server(secrets).unwrap();
+        let before = endpoint.clients[0].server_config.clone();
+        endpoint.set_transport_defaults(TransportSettings::new(
+            quinn_proto::TransportConfig::default(),
+        ));
+        assert!(!Arc::ptr_eq(&before, &endpoint.clients[0].server_config));
     }
 
     #[test]

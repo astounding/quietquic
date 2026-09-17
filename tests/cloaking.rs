@@ -90,7 +90,7 @@ fn random_bytes(len: usize) -> Vec<u8> {
 /// contract, not just "no connection". Returns the server (still bound) in
 /// case a caller wants to make further assertions.
 async fn assert_silent(datagrams: &[Vec<u8>]) {
-    let mut server = Server::bind(secrets_one_client())
+    let server = Server::bind(secrets_one_client())
         .await
         .expect("bind server");
     let server_addr = server.local_addr();
@@ -144,7 +144,7 @@ async fn assert_silent(datagrams: &[Vec<u8>]) {
 /// global bucket, burst 2048, has ample headroom for 100 packets.)
 #[tokio::test]
 async fn junk_scan_is_silent() {
-    let mut server = Server::bind(secrets_one_client())
+    let server = Server::bind(secrets_one_client())
         .await
         .expect("bind server");
     let server_addr = server.local_addr();
@@ -241,7 +241,7 @@ async fn stock_quic_initial_is_silent() {
 /// per-socket dedup) must be dropped by the replay guard.
 #[tokio::test]
 async fn replay_is_silent() {
-    let mut server = Server::bind(secrets_one_client())
+    let server = Server::bind(secrets_one_client())
         .await
         .expect("bind server");
     let server_addr = server.local_addr();
@@ -346,7 +346,7 @@ async fn wrong_psk_crafted_datagram_is_silent() {
 /// `connect` must return `Err`.
 #[tokio::test]
 async fn wrong_psk_client_connect_fails() {
-    let mut server = Server::bind(secrets_one_client())
+    let server = Server::bind(secrets_one_client())
         .await
         .expect("bind server");
     let addr = server.local_addr();
@@ -395,7 +395,7 @@ async fn wrong_psk_client_connect_fails() {
 /// authorized clients.
 #[tokio::test]
 async fn happy_path_connects_and_echoes() {
-    let mut server = Server::bind(secrets_one_client())
+    let server = Server::bind(secrets_one_client())
         .await
         .expect("bind server");
     let addr = server.local_addr();

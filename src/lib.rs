@@ -13,6 +13,10 @@
 //! `README.md`'s `Limitations` section for boundaries not yet
 //! production-hardened (single-threaded driver, compile-time rate limits, CID pruning only at
 //! connection close).
+//!
+//! # Shared endpoint guide
+//!
+#![doc = include_str!("../docs/shared-endpoints.md")]
 
 // Protocol logic lives in the sans-IO core crate; re-exported here so
 // `quietquic::selector::…` (and friends) keep resolving unchanged.
@@ -22,3 +26,8 @@ pub mod client;
 pub mod config;
 pub mod conn;
 pub mod server;
+
+pub mod endpoint;
+pub use endpoint::{
+    Capability, ConnectOptions, Endpoint, EndpointConfig, EndpointError, EndpointTermination,
+};

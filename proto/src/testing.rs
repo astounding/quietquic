@@ -98,6 +98,43 @@ pub fn connected_pair_at(epoch: Instant) -> Pair {
 }
 
 impl Pair {
+    /// Discard one pending client datagram, for deterministic loss tests.
+    pub fn drop_next_client_datagram(&mut self) -> bool {
+        self.client.poll_transmit(self.now).is_some()
+    }
+
+    /// Drive like [`Pair::drive`], but deliver each batch in reverse order.
+    pub fn drive_reordered(&mut self) {
+        for _ in 0..MAX_PASSES {
+            let mut moved = false;
+            while let Some(t) = self.client.poll_transmit(self.now) {
+                self.to_server.push_back(t.contents);
+                moved = true;
+            }
+            while let Some(t) = self.server.poll_transmit(self.now) {
+                self.to_client.push_back(t.contents);
+                moved = true;
+            }
+            while let Some(dg) = self.to_server.pop_back() {
+                if let DatagramOutcome::Accepted(ch) =
+                    self.server.handle_datagram(self.now, self.client_addr, &dg)
+                {
+                    self.server_ch = Some(ch);
+                }
+                moved = true;
+            }
+            while let Some(dg) = self.to_client.pop_back() {
+                self.client.handle_datagram(self.now, self.server_addr, &dg);
+                moved = true;
+            }
+            self.collect_events();
+            if !moved {
+                return;
+            }
+        }
+        panic!("the reordered pair did not quiesce within {MAX_PASSES} passes");
+    }
+
     /// Build an un-driven pair: the client has dialed, but nothing has moved.
     ///
     /// Use this to observe the handshake step by step; [`connected_pair`] is the

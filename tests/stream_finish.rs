@@ -27,7 +27,7 @@ fn server_secrets(suffix: u8) -> (ServerSecrets, String) {
 
 async fn connected_pair(suffix: u8) -> Connected {
     let (secrets, psk_hex) = server_secrets(suffix);
-    let mut server = Server::bind(secrets).await.expect("bind server");
+    let server = Server::bind(secrets).await.expect("bind server");
     let addr = server.local_addr();
     let cfg: ClientConfigFile = toml::from_str(&format!(
         "client_id=\"a\"\npsk=\"{psk_hex}\"\nserver=\"{addr}\"\n"
@@ -123,11 +123,14 @@ async fn peer_stop_is_the_terminal_wait_finished_result() {
     let server_task = tokio::spawn(async move {
         let (_send, mut recv) = server.accept_bi().await.expect("accept stream");
         recv.stop(77).await.expect("stop receive half");
+        // Keep application owners alive until the peer observes STOP_SENDING.
+        // Last-owner connection close is allowed to supersede pending frames.
+        (server, _send, recv)
     });
 
     let (mut send, _recv) = client.open_bi().await.expect("open stream");
     send.write_all(b"stop-me").await.expect("write request");
-    tokio::time::timeout(Duration::from_secs(10), server_task)
+    let _server_owners = tokio::time::timeout(Duration::from_secs(10), server_task)
         .await
         .expect("server stop timeout")
         .expect("server task");
