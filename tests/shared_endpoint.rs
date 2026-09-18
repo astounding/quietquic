@@ -180,6 +180,40 @@ async fn simultaneous_dial_and_accept_works_on_both_endpoints() {
 }
 
 #[tokio::test]
+async fn paused_admission_preserves_dial_streams_and_waiting_accept_until_resume() {
+    let a = endpoint(4070, EndpointConfig::both(vec![credential("shared")])).await;
+    let b = endpoint(4071, EndpointConfig::both(vec![credential("shared")])).await;
+    a.pause_admission().unwrap();
+    let mut pending_accept = Box::pin(a.accept());
+    use std::future::Future;
+    use std::task::{Context, Waker};
+    assert!(pending_accept
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    let (outgoing, incoming) = connected_pair(&a, &b).await;
+    transfer(&outgoing, &incoming, b"outgoing while admission paused").await;
+    transfer(
+        &incoming,
+        &outgoing,
+        b"reverse stream while admission paused",
+    )
+    .await;
+    assert!(pending_accept
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    a.resume_admission().unwrap();
+    let (dialed, accepted) = tokio::join!(
+        timeout(STEP, b.connect(client("shared", a.local_addr()))),
+        timeout(STEP, pending_accept),
+    );
+    let dialed = dialed.unwrap().unwrap();
+    let accepted = accepted.unwrap().unwrap().unwrap();
+    transfer(&dialed, &accepted, b"accept resumed").await;
+}
+
+#[tokio::test]
 async fn dropping_outgoing_attempt_does_not_harm_later_connection() {
     let server = endpoint(4020, EndpointConfig::accept(vec![credential("shared")])).await;
     let client_endpoint = endpoint(4021, EndpointConfig::dial()).await;

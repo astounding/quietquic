@@ -246,7 +246,12 @@ impl Endpoint {
         let mut state = self.shared.state.lock().unwrap();
         let error = if !self.shared.capability.can_dial() {
             Some(EndpointError::CapabilityDisabled)
-        } else if state.close.is_some() || self.shared.termination.borrow().is_some() {
+        } else if let Some(reason) = self.shared.termination.borrow().clone() {
+            Some(match reason {
+                EndpointTermination::Closed => EndpointError::Closed,
+                EndpointTermination::Failed(error) => error,
+            })
+        } else if state.close.is_some() {
             Some(EndpointError::Closed)
         } else if state.in_flight >= OUTGOING_CAPACITY {
             Some(EndpointError::Capacity)
@@ -325,7 +330,13 @@ impl Endpoint {
             return Err(EndpointError::CapabilityDisabled);
         }
         let mut state = self.shared.state.lock().unwrap();
-        if state.close.is_some() || self.shared.termination.borrow().is_some() {
+        if let Some(reason) = self.shared.termination.borrow().clone() {
+            return Err(match reason {
+                EndpointTermination::Closed => EndpointError::Closed,
+                EndpointTermination::Failed(error) => error,
+            });
+        }
+        if state.close.is_some() {
             return Err(EndpointError::Closed);
         }
         state.pause = pause;
@@ -339,7 +350,13 @@ impl Endpoint {
         transport: TransportSettings,
     ) -> Result<(), EndpointError> {
         let mut state = self.shared.state.lock().unwrap();
-        if state.close.is_some() || self.shared.termination.borrow().is_some() {
+        if let Some(reason) = self.shared.termination.borrow().clone() {
+            return Err(match reason {
+                EndpointTermination::Closed => EndpointError::Closed,
+                EndpointTermination::Failed(error) => error,
+            });
+        }
+        if state.close.is_some() {
             return Err(EndpointError::Closed);
         }
         state.transport = transport.clone();
@@ -426,7 +443,13 @@ impl Attempt {
     }
     fn uncount(&self) {
         if self.counted.swap(false, Ordering::AcqRel) {
-            self.shared.state.lock().unwrap().in_flight -= 1;
+            let mut state = self.shared.state.lock().unwrap();
+            state.in_flight -= 1;
+            // Cancellation can happen repeatedly without yielding to the
+            // driver. Release the queued request as well as its capacity slot.
+            state
+                .outgoing
+                .retain(|queued| !std::ptr::eq(queued.as_ref(), self));
         }
     }
 }
@@ -500,6 +523,12 @@ impl Future for Accept<'_> {
             waker.clone_from(cx.waker());
         }
         if state.waiters.front().is_some_and(|(id, _)| *id == ticket) {
+            // Closure is published before the driver takes this queue lock to
+            // reap an incoming item. Do not hand off a known-dead connection
+            // in that interval. Closure after this check is a normal race.
+            state
+                .incoming
+                .retain(|connection| connection.terminal_reason().is_none());
             if let Some(connection) = state.incoming.pop_front() {
                 state.waiters.pop_front();
                 state.accepted.push(connection.handle());
@@ -584,26 +613,7 @@ impl Driver {
                 _ = wake.notified() => {},
                 value = self.cleanup_rx.recv() => { if let Some(value) = value { self.clean(value); } },
                 value = self.command_rx.recv() => { if let Some(value) = value { self.command(value); } },
-                result = self.socket.recv_from(&mut buffer), if self.recv_retry_at.is_none() => match result {
-                    Ok((n, from)) => {
-                        self.control();
-                        // Serialize the admission boundary with synchronous
-                        // pause/default updates from other runtime workers.
-                        let shared = self.shared.clone();
-                        let mut state = shared.state.lock().unwrap();
-                        if state.pause || state.close.is_some() || self.endpoint_gone_seen || self.shutdown.is_some() {
-                            self.core.pause_admission();
-                        } else {
-                            self.core.resume_admission();
-                        }
-                        if let Some(settings) = state.transport_update.take() { self.core.set_transport_defaults(settings); }
-                        self.core.handle_datagram(Instant::now(), from, &buffer[..n]);
-                    },
-                    Err(error) if transient(&error) => {
-                        self.recv_retry_at = Some(Instant::now() + SOCKET_RETRY_DELAY);
-                    },
-                    Err(error) => self.fail_socket(error),
-                },
+                result = self.socket.recv_from(&mut buffer), if self.recv_retry_at.is_none() => self.received(result, &buffer),
                 result = self.socket.writable(), if !self.pending_transmits.is_empty() && self.send_retry_at.is_none() => {
                     if let Err(error) = result { self.fail_socket(error); }
                 },
@@ -615,6 +625,36 @@ impl Driver {
         let shared = self.shared.clone();
         drop(self); // Release socket before publishing completion.
         shared.closed.send_replace(true);
+    }
+
+    fn received(&mut self, result: io::Result<(usize, SocketAddr)>, buffer: &[u8]) {
+        match result {
+            Ok((n, from)) => {
+                self.control();
+                // Serialize admission with synchronous pause/default updates
+                // from other runtime workers.
+                let shared = self.shared.clone();
+                let mut state = shared.state.lock().unwrap();
+                if state.pause
+                    || state.close.is_some()
+                    || self.endpoint_gone_seen
+                    || self.shutdown.is_some()
+                {
+                    self.core.pause_admission();
+                } else {
+                    self.core.resume_admission();
+                }
+                if let Some(settings) = state.transport_update.take() {
+                    self.core.set_transport_defaults(settings);
+                }
+                self.core
+                    .handle_datagram(Instant::now(), from, &buffer[..n]);
+            }
+            Err(error) if transient(&error) => {
+                self.recv_retry_at = Some(Instant::now() + SOCKET_RETRY_DELAY);
+            }
+            Err(error) => self.fail_socket(error),
+        }
     }
 
     fn control(&mut self) {
@@ -821,6 +861,7 @@ impl Driver {
                     self.commands.clone(),
                     self.cleanup.clone(),
                     closed_rx.clone(),
+                    self.shared.wake.clone(),
                 );
                 let connection = Connection::new(ch, remote, id, cmds, closed_rx);
                 if let Some(attempt) = self.attempts.remove(&ch) {
@@ -1001,6 +1042,7 @@ fn flush_datagrams(
 mod tests {
     use super::*;
     use quinn_proto::{Dir, Side, StreamId};
+    include!("endpoint_audit_stream_tests.rs");
 
     #[test]
     fn transient_send_errors_back_off_until_retry_deadline() {
@@ -1569,6 +1611,260 @@ mod tests {
         driver.control();
         assert!(driver.core.is_idle());
         assert_eq!(endpoint.shared.state.lock().unwrap().in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_canceled_dials_release_queue_storage_without_driver_service() {
+        let (endpoint, mut driver) = unstarted().await;
+        for _ in 0..1024 {
+            drop(endpoint.connect(client()));
+            let state = endpoint.shared.state.lock().unwrap();
+            assert_eq!(state.in_flight, 0);
+            assert!(state.outgoing.is_empty());
+        }
+        driver.control();
+        assert!(driver.core.is_idle());
+    }
+
+    #[tokio::test]
+    async fn late_dial_retains_original_socket_failure() {
+        let (endpoint, mut driver) = unstarted().await;
+        driver.fail_socket(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "persistent failure",
+        ));
+        for _ in 0..2 {
+            assert!(matches!(endpoint.connect(client()).await,
+                Err(EndpointError::Socket { message, .. }) if message == "persistent failure"));
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_errors_back_off_or_terminate_without_rebinding() {
+        let (endpoint, mut driver) = unstarted().await;
+        let local = endpoint.local_addr();
+        let now = Instant::now();
+        driver.received(Err(io::Error::from(io::ErrorKind::Interrupted)), &[]);
+        assert!(driver.recv_retry_at.unwrap() >= now + SOCKET_RETRY_DELAY);
+        assert!(endpoint.shared.termination.borrow().is_none());
+        let attempt = endpoint.connect(client());
+        driver.received(
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "receive failure",
+            )),
+            &[],
+        );
+        assert!(
+            matches!(attempt.await, Err(EndpointError::Socket { message, .. }) if message == "receive failure")
+        );
+        assert!(driver.finished());
+        assert_eq!(driver.socket.local_addr().unwrap(), local);
+        assert!(matches!(
+            endpoint.terminated().await,
+            EndpointTermination::Failed(_)
+        ));
+        assert!(std::net::UdpSocket::bind(local).is_err());
+        drop(driver);
+        assert!(std::net::UdpSocket::bind(local).is_ok());
+    }
+
+    #[tokio::test]
+    async fn endpoint_accept_fifo_survives_middle_waiter_cancellation() {
+        let (mut pair, a, b, _client, _server) = ManualPair::connected().await;
+        let mut first = Box::pin(b.accept());
+        let mut middle = Box::pin(b.accept());
+        let mut last = Box::pin(b.accept());
+        for waiter in [&mut first, &mut middle, &mut last] {
+            assert!(waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        drop(middle);
+        let _first_client = pair
+            .complete(a.connect(client_config_for(b.local_addr())))
+            .unwrap();
+        let _last_client = pair
+            .complete(a.connect(client_config_for(b.local_addr())))
+            .unwrap();
+        let ids: Vec<_> = b
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .incoming
+            .iter()
+            .map(Connection::handle)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        // Polling the newer waiter first cannot let it bypass the oldest.
+        assert!(last
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        assert_eq!(pair.complete(first).unwrap().unwrap().handle(), ids[0]);
+        assert_eq!(pair.complete(last).unwrap().unwrap().handle(), ids[1]);
+        assert!(b.shared.state.lock().unwrap().waiters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fatal_receive_wakes_all_acceptors_and_persists_for_late_operations() {
+        let (mut pair, _a, b, _client, _server) = ManualPair::connected().await;
+        let mut waits = Vec::new();
+        for _ in 0..3 {
+            let mut accept = Box::pin(b.accept());
+            assert!(accept
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+            waits.push(accept);
+        }
+        pair.b.received(
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "receive failure",
+            )),
+            &[],
+        );
+        for wait in waits {
+            assert!(
+                matches!(pair.complete(wait), Err(EndpointError::Socket { message, .. }) if message == "receive failure")
+            );
+        }
+        assert!(b.shared.state.lock().unwrap().waiters.is_empty());
+        for _ in 0..2 {
+            assert!(
+                matches!(pair.complete(b.accept()), Err(EndpointError::Socket { message, .. }) if message == "receive failure")
+            );
+        }
+        assert!(matches!(
+            b.pause_admission(),
+            Err(EndpointError::Socket { .. })
+        ));
+        assert!(matches!(
+            b.set_transport_defaults(TransportSettings::default()),
+            Err(EndpointError::Socket { .. })
+        ));
+        let reason = pair.complete(b.terminated());
+        b.close(0, b"late close").unwrap();
+        assert_eq!(pair.complete(b.terminated()), reason);
+        assert!(pair.b.finished());
+    }
+
+    #[tokio::test]
+    async fn canceling_wait_closed_neither_starts_nor_stops_shutdown() {
+        let endpoint = Endpoint::bind("127.0.0.1:0".parse().unwrap(), EndpointConfig::dial())
+            .await
+            .unwrap();
+        let local = endpoint.local_addr();
+        let mut wait = Box::pin(endpoint.wait_closed());
+        assert!(wait
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        drop(wait);
+        assert!(endpoint.shared.termination.borrow().is_none());
+        assert!(std::net::UdpSocket::bind(local).is_err());
+        endpoint.close(0, b"done").unwrap();
+        let mut wait = Box::pin(endpoint.wait_closed());
+        assert!(wait
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        drop(wait);
+        endpoint.close(0, b"repeat").unwrap();
+        tokio::time::timeout(Duration::from_secs(2), endpoint.wait_closed())
+            .await
+            .unwrap();
+        assert!(std::net::UdpSocket::bind(local).is_ok());
+    }
+
+    #[tokio::test]
+    async fn last_connection_owner_drop_closes_only_its_transport() {
+        let (mut pair, a, b, client, server) = ManualPair::connected().await;
+        let healthy = pair
+            .complete(a.connect(client_config_for(b.local_addr())))
+            .unwrap();
+        let peer = pair.complete(b.accept()).unwrap().unwrap();
+        let old = client.handle();
+        drop(client);
+        pair.drive();
+        assert!(pair.a.core.conn_mut(old).is_none());
+        assert!(matches!(
+            pair.complete(server.closed()),
+            ConnectionError::ApplicationClosed { code: 0, .. }
+        ));
+        let (mut send, _recv) = pair.complete(healthy.open_bi()).unwrap();
+        pair.complete(send.write_all(b"surviving owner")).unwrap();
+        let (_send, mut recv) = pair.complete(peer.accept_bi()).unwrap();
+        assert_eq!(pair.complete(recv.read(32)).unwrap(), b"surviving owner");
+    }
+
+    #[tokio::test]
+    async fn per_attempt_transport_override_is_advertised_without_changing_defaults() {
+        let (mut pair, a, b, _client, server) = ManualPair::connected().await;
+        let mut transport = quinn_proto::TransportConfig::default();
+        transport.max_concurrent_bidi_streams(VarInt::from_u32(1));
+        let _limited = pair
+            .complete(a.connect_with(
+                client_config_for(b.local_addr()),
+                ConnectOptions {
+                    transport: Some(TransportSettings::new(transport)),
+                    handshake_timeout: None,
+                },
+            ))
+            .unwrap();
+        let limited_peer = pair.complete(b.accept()).unwrap().unwrap();
+        let _one = pair.complete(limited_peer.open_bi()).unwrap();
+        assert!(matches!(
+            pair.complete(limited_peer.try_open_bi()).unwrap(),
+            crate::conn::TryOpenOutcome::TemporarilyUnavailable
+        ));
+        let _existing_one = pair.complete(server.open_bi()).unwrap();
+        let _existing_two = pair.complete(server.open_bi()).unwrap();
+        let _default = pair
+            .complete(a.connect(client_config_for(b.local_addr())))
+            .unwrap();
+        let default_peer = pair.complete(b.accept()).unwrap().unwrap();
+        let _default_one = pair.complete(default_peer.open_bi()).unwrap();
+        let _default_two = pair.complete(default_peer.open_bi()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn accept_filters_closed_connection_before_driver_queue_reaping() {
+        let (mut pair, a, b, _client, _server) = ManualPair::connected().await;
+        let _extra = pair
+            .complete(a.connect(client_config_for(b.local_addr())))
+            .unwrap();
+        pair.drive();
+        let handle = b
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .incoming
+            .front()
+            .unwrap()
+            .handle();
+        pair.b
+            .parked
+            .get(&handle)
+            .unwrap()
+            .mark_closed(ConnectionError::LocallyClosed);
+        let mut accept = Box::pin(b.accept());
+        assert!(accept
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        assert!(b.shared.state.lock().unwrap().incoming.is_empty());
+        drop(accept);
+        let _healthy = pair
+            .complete(a.connect(client_config_for(b.local_addr())))
+            .unwrap();
+        let accepted = pair.complete(b.accept()).unwrap().unwrap();
+        assert_ne!(accepted.handle(), handle);
+        assert_eq!(accepted.remote_address(), a.local_addr());
     }
 
     #[tokio::test]

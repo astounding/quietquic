@@ -14,10 +14,13 @@
 use quinn_proto::{Side, TransportConfig, VarInt};
 use std::time::{Duration, Instant};
 
-use quietquic_proto::config::{ClientConfigFile, EndpointConfig, ServerSecrets, TransportSettings};
+use quietquic_proto::config::{
+    ClientConfigFile, EndpointConfig, ServerSecrets, TransportSettings, MAX_ENDPOINT_DURATION,
+};
+use quietquic_proto::conn::AUTO_CODE_START;
 use quietquic_proto::endpoint::Endpoint;
 use quietquic_proto::freshness::now_minutes;
-use quietquic_proto::outcome::{ConnectionError, DatagramOutcome, Event};
+use quietquic_proto::outcome::{CloseConnectionError, ConnectionError, DatagramOutcome, Event};
 use quietquic_proto::testing::{connected_pair, Pair};
 
 /// Bound on timer-firing passes when reaping a closed connection. A close timer
@@ -280,6 +283,54 @@ fn pending_admission_is_bounded_and_mark_accepted_releases_the_slot() {
 }
 
 #[test]
+fn admission_bound_combines_completed_and_in_progress_connections() {
+    let now = Instant::now();
+    let (secrets, client_cfg) = configs();
+    let mut cfg = EndpointConfig::accept(secrets.clients);
+    cfg.max_pending_incoming = 2;
+    let mut server = Endpoint::new(cfg).unwrap();
+
+    let (_completed_client, completed) = connect_to_server(
+        &mut server,
+        client_cfg.clone(),
+        "127.0.0.1:5301".parse().unwrap(),
+        now,
+    );
+    let (mut handshaking_client, _) =
+        Endpoint::new_client(now, now_minutes(), client_cfg.clone()).unwrap();
+    let handshaking_initial = handshaking_client.poll_transmit(now).unwrap().contents;
+    assert!(matches!(
+        server.handle_datagram(now, "127.0.0.1:5302".parse().unwrap(), &handshaking_initial),
+        DatagramOutcome::Accepted(_)
+    ));
+    assert_eq!(server.pending_incoming_count(), 2);
+    while server.poll_transmit(now).is_some() {}
+
+    let (mut rejected_client, _) = Endpoint::new_client(now, now_minutes(), client_cfg).unwrap();
+    let rejected_initial = rejected_client.poll_transmit(now).unwrap().contents;
+    let connection_count = server.connections().count();
+    let cid_count = server.issued_cid_count();
+    assert_eq!(
+        server.handle_datagram(now, "127.0.0.1:5303".parse().unwrap(), &rejected_initial),
+        DatagramOutcome::Dropped
+    );
+    assert_eq!(server.connections().count(), connection_count);
+    assert_eq!(server.issued_cid_count(), cid_count);
+    assert!(
+        server.poll_transmit(now).is_none(),
+        "full admission is silent"
+    );
+
+    server.mark_accepted(completed).unwrap();
+    assert_eq!(server.pending_incoming_count(), 1);
+    assert!(matches!(
+        server.handle_datagram(now, "127.0.0.1:5303".parse().unwrap(), &rejected_initial),
+        DatagramOutcome::Accepted(_)
+    ));
+    assert_eq!(server.pending_incoming_count(), 2);
+}
+
+#[test]
 fn pausing_admission_preserves_an_already_admitted_connection() {
     let mut pair = connected_pair();
     let server_ch = pair.server_ch();
@@ -341,6 +392,46 @@ fn force_remove_drains_transport_and_prunes_all_bookkeeping() {
         pair.server().poll_event(),
         Some(Event::ConnectionLost { conn, reason: ConnectionError::TimedOut }) if conn == ch
     ));
+}
+
+#[test]
+fn application_connection_close_cannot_claim_reserved_cleanup_codes() {
+    let mut pair = connected_pair();
+    let ch = pair.client_ch();
+    let now = pair.now();
+
+    assert_eq!(
+        pair.client().close_connection(
+            now,
+            ch,
+            VarInt::from_u64(AUTO_CODE_START).expect("reserved code is a QUIC varint"),
+            Vec::new(),
+        ),
+        Err(CloseConnectionError::ReservedCode {
+            code: AUTO_CODE_START
+        }),
+        "the automatic-cleanup range is reserved to QuietQUIC",
+    );
+    assert!(
+        pair.client().conn_mut(ch).is_some(),
+        "rejecting an application code must leave the connection untouched"
+    );
+
+    pair.client()
+        .close_connection(
+            now,
+            ch,
+            VarInt::from_u64(AUTO_CODE_START - 1).expect("application code is a QUIC varint"),
+            Vec::new(),
+        )
+        .expect("the highest application-owned code remains valid");
+    assert!(pair.client().conn_mut(ch).is_none());
+    assert_eq!(
+        pair.client()
+            .close_connection(now, ch, VarInt::from_u32(0), Vec::new()),
+        Err(CloseConnectionError::UnknownConnection),
+        "a stale handle remains distinguishable from an invalid close code"
+    );
 }
 
 #[test]
@@ -499,6 +590,81 @@ fn oversized_attempt_deadline_is_rejected_before_allocation() {
     assert!(endpoint.is_idle());
     assert_eq!(endpoint.connections().count(), 0);
     assert_eq!(endpoint.issued_cid_count(), 0);
+}
+
+#[test]
+fn outgoing_override_times_out_without_harming_healthy_sibling() {
+    let now = Instant::now();
+    let (secrets, healthy_cfg) = configs();
+    let server_addr = healthy_cfg.server;
+    let client_addr = "127.0.0.1:5401".parse().unwrap();
+    let mut server = Endpoint::new(EndpointConfig::accept(secrets.clients)).unwrap();
+    let mut client_config = EndpointConfig::dial();
+    client_config.outgoing_handshake_timeout = Duration::from_secs(30);
+    let mut client = Endpoint::new(client_config).unwrap();
+    let healthy = client
+        .connect(now, now_minutes(), healthy_cfg.clone(), None, None)
+        .unwrap();
+    let mut doomed_cfg = healthy_cfg;
+    doomed_cfg.server = "127.0.0.1:5999".parse().unwrap();
+    let doomed = client
+        .connect(
+            now,
+            now_minutes(),
+            doomed_cfg,
+            None,
+            Some(Duration::from_millis(5)),
+        )
+        .unwrap();
+
+    let mut healthy_connected = false;
+    for _ in 0..128 {
+        while let Some(tx) = client.poll_transmit(now) {
+            if tx.destination == server_addr {
+                server.handle_datagram(now, client_addr, &tx.contents);
+            }
+        }
+        while let Some(tx) = server.poll_transmit(now) {
+            client.handle_datagram(now, server_addr, &tx.contents);
+        }
+        while let Some(event) = client.poll_event() {
+            healthy_connected |= matches!(event, Event::Connected(ch) if ch == healthy);
+        }
+        if healthy_connected {
+            break;
+        }
+    }
+    assert!(
+        healthy_connected,
+        "healthy sibling completes before timeout"
+    );
+
+    client.handle_timeout(now + Duration::from_millis(5));
+    assert!(client.conn_mut(healthy).is_some());
+    assert!(client.conn_mut(doomed).is_none());
+    assert!(matches!(
+        client.poll_event(),
+        Some(Event::ConnectionLost {
+            conn,
+            reason: ConnectionError::TimedOut
+        }) if conn == doomed
+    ));
+}
+
+#[test]
+fn maximum_finite_outgoing_override_is_accepted() {
+    let now = Instant::now();
+    let (_, client_cfg) = configs();
+    let mut endpoint = Endpoint::new(EndpointConfig::dial()).unwrap();
+    assert!(endpoint
+        .connect(
+            now,
+            now_minutes(),
+            client_cfg,
+            None,
+            Some(MAX_ENDPOINT_DURATION),
+        )
+        .is_ok());
 }
 
 #[test]

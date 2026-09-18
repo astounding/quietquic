@@ -1,7 +1,11 @@
 # QuietQUIC shared-endpoint release plan
 
-Status: implementation and local command validation complete; hosted platform,
-minimum-Rust runtime, and cross-host release evidence remain pending.
+Status: candidate `9f1d887` passed local validation, hosted Linux, macOS,
+FreeBSD, Rust 1.88, and the cross-host transport run. The subsequent
+[release audit](../notes/2026-09-19-release-audit.md) adds fixes and focused
+tests; its changed candidate needs fresh hosted and cross-host validation.
+See [prior cross-host evidence](../notes/2026-09-18-cross-host-validation.md).
+Release/version selection and publication remain separate work.
 Date: 2026-09-17.
 Provisional target: `0.1.0-alpha.4` for both crates, subject to checking release
 state before choosing the final version. This is another experimental release,
@@ -456,8 +460,9 @@ server startup before attributing network timeouts to the protocol.
 
 After automated tests pass, the owner will arrange a public-IP Linux or FreeBSD
 VM on demand. This workspace's CGNAT path to that VM can also satisfy the
-cross-host transport gate if the required scenarios are run there. Availability
-is pending; do not report the release gate complete without results.
+cross-host transport gate if the required scenarios are run there. The owner
+provided that host and the required run passed on 2026-09-18; results and scope
+are recorded in the cross-host evidence note linked above.
 
 Persistent reverse-tunnel idle behavior, management heartbeat detection,
 reconnection, and named-service recovery through real CGNAT remain qquicusock

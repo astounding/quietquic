@@ -25,8 +25,11 @@ doesn't advertise itself to the internet) to frame however it likes.
 > has extensive automated tests but has not yet received an independent
 > cryptographic review. Do not treat it as production-hardened.
 
-This checkout documents the **unreleased shared-endpoint API**. Platform and
-cross-host release validation remain separate gates.
+This checkout documents the **unreleased shared-endpoint API**. Candidate
+`9f1d887` passed the recorded Linux, macOS, FreeBSD, Rust 1.88, and cross-host
+transport runs. The [release audit](docs/notes/2026-09-19-release-audit.md)
+subsequently added fixes that pass local validation. Fresh hosted and
+cross-host testing of those changes, plus release bookkeeping, remain.
 
 ## Architecture: two crates, pick your I/O model
 

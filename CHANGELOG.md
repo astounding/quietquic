@@ -18,6 +18,10 @@ Semantic Versioning while its wire protocol and Rust API remain experimental.
   stream opens, reads, writes, FIN waits, and uniquely owned stream halves.
 - Add structured reset outcomes, reserved automatic-cleanup codes,
   `try_open_bi`, and partial-prefix ownership in `ReadToEndError`.
+- Reject reserved codes in core connection closes with `CloseConnectionError`
+  and expose `AutomaticCode` through the Tokio API. Preserve the original reset
+  outcome across FIN races, coalesce cancellation wakes, release canceled dial
+  queue entries promptly, and retain fatal endpoint errors for late callers.
 - Keep `Server` and `Client` as conveniences backed by the shared endpoint
   driver, and document migration to the primary `Endpoint` API.
 - Add deterministic and real-UDP coverage for overlapping fixed-port dials,

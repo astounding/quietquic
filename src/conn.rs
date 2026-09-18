@@ -174,7 +174,7 @@ impl<T> Drop for HandoffRx<T> {
 /// tokio application see one error type, not two that must be translated. It is
 /// re-exported here so `quietquic::conn::ConnError` keeps resolving.
 pub use quietquic_proto::conn::{
-    ConnError, ResetOutcome, AUTO_CODE_START, AUTO_RESET_CANCELLED_OPEN,
+    AutomaticCode, ConnError, ResetOutcome, AUTO_CODE_START, AUTO_RESET_CANCELLED_OPEN,
     AUTO_RESET_CANCELLED_WRITE, AUTO_RESET_DROPPED_SEND, AUTO_STOP_CANCELLED_OPEN,
     AUTO_STOP_DROPPED_RECV, AUTO_STOP_READ_LIMIT,
 };
@@ -235,6 +235,7 @@ pub(crate) struct CmdSender {
     write_budget: Arc<Semaphore>,
     open_budget: Arc<Semaphore>,
     accept_budget: Arc<Semaphore>,
+    wake: Arc<Notify>,
 }
 
 impl CmdSender {
@@ -243,6 +244,7 @@ impl CmdSender {
         tx: mpsc::Sender<Tagged>,
         cleanup: mpsc::UnboundedSender<TaggedCleanup>,
         closed: watch::Receiver<Option<ConnectionError>>,
+        wake: Arc<Notify>,
     ) -> Self {
         let owner = Arc::new(OwnerLease {
             handle,
@@ -257,6 +259,7 @@ impl CmdSender {
             write_budget: Arc::new(Semaphore::new(256 * 1024)),
             open_budget: Arc::new(Semaphore::new(256)),
             accept_budget: Arc::new(Semaphore::new(256)),
+            wake,
         }
     }
 
@@ -322,6 +325,10 @@ impl CmdSender {
     }
 
     fn cleanup(&self, cleanup: Cleanup) {
+        if matches!(cleanup, Cleanup::Wake) {
+            self.wake.notify_one();
+            return;
+        }
         let _ = self.cleanup.send(TaggedCleanup {
             handle: self.handle,
             cleanup,
@@ -457,6 +464,25 @@ impl Connection {
     /// The endpoint-local handle identifying this connection.
     pub fn handle(&self) -> ConnectionHandle {
         self.handle
+    }
+
+    /// Return the persistent terminal cause once this connection has stopped.
+    ///
+    /// The endpoint uses this before handing off a queued incoming connection,
+    /// so a connection that died after admission but before application
+    /// delivery is skipped rather than exposed as a fresh connection.
+    pub(crate) fn terminal_reason(&self) -> Option<ConnectionError> {
+        self.closed.borrow().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_write_budget(&self) -> usize {
+        self.cmds.write_budget.available_permits()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_open_budget(&self) -> usize {
+        self.cmds.open_budget.available_permits()
     }
 
     /// Authenticated server-side client identity.
@@ -912,12 +938,17 @@ impl SendStream {
 
     pub async fn reset(&mut self, code: u64) -> Result<ResetOutcome, ConnError> {
         let code = app_varint(code)?;
-        if let Some(terminal) = self.terminal.lock().unwrap().clone() {
-            return match terminal {
-                Ok(()) => Ok(ResetOutcome::AlreadyAcknowledged),
-                Err(ConnError::Stopped { code }) => Ok(ResetOutcome::PeerStopped { code }),
-                Err(error) => Err(error),
-            };
+        let recorded = { self.terminal.lock().unwrap().clone() };
+        match recorded {
+            Some(Ok(())) => return Ok(ResetOutcome::AlreadyAcknowledged),
+            Some(Err(ConnError::Stopped { code })) => {
+                return Ok(ResetOutcome::PeerStopped { code });
+            }
+            // A reset records ClosedStream for FIN waiters, but the core
+            // retains the original reset code. Fall through and ask it for the
+            // idempotent ResetOutcome instead of losing that stable fact.
+            Some(Err(ConnError::ClosedStream)) | None => {}
+            Some(Err(error)) => return Err(error),
         }
         let (tx, rx) = oneshot::channel();
         self.cmds

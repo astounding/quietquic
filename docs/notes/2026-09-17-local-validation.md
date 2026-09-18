@@ -254,6 +254,13 @@ and its hosted results remain a separate gate.
 
 ## Non-local release evidence
 
+Subsequent evidence: candidate `9f1d887` passed GitHub Linux, macOS, FreeBSD,
+and Rust 1.88 jobs and the 2026-09-18 cross-host transport run. See
+[the dated evidence note](2026-09-18-cross-host-validation.md). The list below
+is the historical local-checkpoint checklist; the later note supersedes its
+pending platform and transport status. Application-level CGNAT tests remain
+separate.
+
 - [ ] macOS runtime gate, including recorded architecture and commit.
 - [ ] FreeBSD runtime gate, including recorded architecture and commit.
 - [ ] Cross-host transport gate and later owner-arranged CGNAT run.

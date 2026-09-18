@@ -80,14 +80,15 @@ use quinn_proto::{
 use crate::config::{
     ClientConfigFile, ConfigError, EndpointConfig, Psk, ServerSecrets, TransportSettings,
 };
-use crate::conn::ConnState;
+use crate::conn::{ConnState, AUTO_CODE_START};
 use crate::crypto::{
     quic_client_config, random_bytes, reset_key, token_key, RecordingCidGenerator, SelfSigned,
 };
 use crate::freshness::{is_fresh, now_minutes, WINDOW_MINUTES};
 use crate::initial_keys::{PskClientConfig, PskServerConfig};
 use crate::outcome::{
-    ConnectionError, ConnectionHandle, ConnectionHandleError, DatagramOutcome, Event, Transmit,
+    CloseConnectionError, ConnectionError, ConnectionHandle, ConnectionHandleError,
+    DatagramOutcome, Event, Transmit,
 };
 use crate::ratelimit::RateLimiter;
 use crate::replay::ReplayGuard;
@@ -694,14 +695,34 @@ impl Endpoint {
         self.refresh_next_timeout();
     }
 
+    /// Close one connection with an application-owned error code.
+    ///
+    /// Codes at or above [`AUTO_CODE_START`] are reserved for QuietQUIC's
+    /// automatic cleanup and are rejected without changing connection state.
     pub fn close_connection(
         &mut self,
         now: Instant,
         ch: ConnectionHandle,
         code: VarInt,
         reason: Vec<u8>,
-    ) -> Result<(), ConnectionHandleError> {
-        let state = self.connections.get_mut(&ch).ok_or(ConnectionHandleError)?;
+    ) -> Result<(), CloseConnectionError> {
+        // The high application-code range identifies cleanup initiated by the
+        // library (dropped/cancelled stream operations). Letting an application
+        // use it for CONNECTION_CLOSE would make the peer's interpretation
+        // ambiguous. Endpoint-owned shutdown uses code zero and therefore does
+        // not pass through this guard.
+        if code.into_inner() >= AUTO_CODE_START {
+            return Err(CloseConnectionError::ReservedCode {
+                code: code.into_inner(),
+            });
+        }
+        if self.terminal_connections.contains_key(&ch) {
+            return Err(CloseConnectionError::UnknownConnection);
+        }
+        let state = self
+            .connections
+            .get_mut(&ch)
+            .ok_or(CloseConnectionError::UnknownConnection)?;
         state.conn_mut().close(now, code, reason.into());
         self.handshake_deadlines.remove(&ch);
         let reason = self
@@ -1354,6 +1375,57 @@ mod tests {
             quinn_proto::TransportConfig::default(),
         ));
         assert!(!Arc::ptr_eq(&before, &endpoint.clients[0].server_config));
+    }
+
+    #[test]
+    fn bounded_service_rotates_transmit_progress_across_connections() {
+        let now = Instant::now();
+        let mut config = EndpointConfig::dial();
+        config.max_connection_work = 1;
+        config.max_outbound_datagrams = 1;
+        let mut endpoint = Endpoint::new(config).expect("endpoint");
+        let destinations: Vec<SocketAddr> = [4401, 4402, 4403]
+            .into_iter()
+            .map(|port| SocketAddr::from(([127, 0, 0, 1], port)))
+            .collect();
+
+        for destination in &destinations {
+            let client: ClientConfigFile = toml::from_str(&format!(
+                "client_id=\"fairness\"\n\
+                 psk=\"0000000000000000000000000000000000000000000000000000000000000001\"\n\
+                 server=\"{destination}\"\n"
+            ))
+            .expect("client config");
+            endpoint
+                .connect(now, now_minutes(), client, None, None)
+                .expect("dial");
+        }
+
+        // Each pass can queue only one Initial. The connection that fills the
+        // queue therefore blocks every sibling for that pass; rotating the
+        // starting handle must still give all three real transmit progress in
+        // at most three passes.
+        let mut served = Vec::new();
+        for _ in 0..destinations.len() {
+            endpoint.service_connections(now);
+            served.push(
+                endpoint
+                    .outbound
+                    .pop_front()
+                    .expect("one bounded transmit per pass")
+                    .destination,
+            );
+            assert!(
+                endpoint.needs_service,
+                "a full outbound queue must retain the immediate-work signal"
+            );
+        }
+
+        assert_eq!(
+            served, destinations,
+            "the oldest connection may fill one pass, but cannot monopolize later passes"
+        );
+        assert_eq!(endpoint.service_cursor, 0, "one full rotation completed");
     }
 
     #[test]

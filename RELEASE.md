@@ -17,11 +17,13 @@
    cargo deny check
    ```
 
-   For the first public release of the renamed `quietquic-proto` crate, the
-   wrapper package cannot verify until the exact pinned core version is visible
-   in the crates.io index. In that bootstrap case, publish
-   `quietquic-proto` first, wait for indexing, then run
-   `cargo package -p quietquic` before publishing `quietquic`.
+   Whenever the wrapper advances its exact `quietquic-proto` version pin, the
+   wrapper package cannot complete ordinary registry-based verification until
+   that core version is visible in the crates.io index. Before publication, use
+   `scripts/check-packages.sh` to validate both candidate archives together.
+   At publication, publish `quietquic-proto` first, wait for indexing, then run
+   ordinary `cargo package -p quietquic` verification before publishing
+   `quietquic`.
 
 5. Run dependency vulnerability, license, and source-policy checks.
 6. Inspect `cargo package --list` for each crate.

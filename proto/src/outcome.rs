@@ -131,6 +131,20 @@ pub enum ConnectionError {
 #[error("connection handle is stale or belongs to another endpoint")]
 pub struct ConnectionHandleError;
 
+/// Why an explicit application-requested connection close was rejected.
+///
+/// QuietQUIC reserves the top of the QUIC application error-code space for
+/// automatic stream cleanup. Applications cannot use that range for a
+/// connection close because doing so would make the peer's interpretation of
+/// the code ambiguous.
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+pub enum CloseConnectionError {
+    #[error("connection handle is stale or belongs to another endpoint")]
+    UnknownConnection,
+    #[error("application close code {code} is reserved by QuietQUIC")]
+    ReservedCode { code: u64 },
+}
+
 impl ConnectionError {
     pub(crate) fn from_quinn(reason: quinn_proto::ConnectionError) -> Self {
         match reason {

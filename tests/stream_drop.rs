@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use quietquic::config::{ClientConfigFile, ClientEntry, ServerSecrets};
 use quietquic::conn::{
-    ConnError, ResetOutcome, AUTO_CODE_START, AUTO_RESET_DROPPED_SEND, AUTO_STOP_DROPPED_RECV,
+    AutomaticCode, ConnError, ResetOutcome, AUTO_CODE_START, AUTO_RESET_CANCELLED_OPEN,
+    AUTO_RESET_CANCELLED_WRITE, AUTO_RESET_DROPPED_SEND, AUTO_STOP_CANCELLED_OPEN,
+    AUTO_STOP_DROPPED_RECV, AUTO_STOP_READ_LIMIT,
 };
 use quietquic::{Endpoint, EndpointConfig};
 use tokio::time::timeout;
@@ -156,6 +158,50 @@ async fn unfinished_recv_drop_stops_peer_and_opposite_direction_survives() {
 }
 
 #[tokio::test]
+async fn read_limit_stops_only_the_receive_direction_and_returns_bounded_prefix() {
+    let (_dialer, _server, client_conn, server_conn) = pair().await;
+    let (mut client_send, mut client_recv) = client_conn.open_bi().await.unwrap();
+    client_send.write_all(b"overflow").await.unwrap();
+    let (mut server_send, mut server_recv) = timeout(STEP, server_conn.accept_bi())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let error = server_recv.read_to_end(3).await.unwrap_err();
+    assert_eq!(error.prefix, b"ove");
+    assert_eq!(error.error, ConnError::ReadLimitExceeded { limit: 3 });
+
+    let observe_stop = async {
+        match client_send.finish().await {
+            Err(ConnError::Stopped { code }) => assert_eq!(code, AUTO_STOP_READ_LIMIT),
+            Ok(()) => assert_eq!(
+                client_send.wait_finished().await.unwrap_err(),
+                ConnError::Stopped {
+                    code: AUTO_STOP_READ_LIMIT
+                }
+            ),
+            Err(error) => panic!("unexpected send terminal error: {error:?}"),
+        }
+    };
+    let reverse = async {
+        server_send.write_all(b"still usable").await.unwrap();
+        server_send.finish_and_wait().await.unwrap();
+    };
+    let receive_reverse = async { client_recv.read_to_end(64).await.unwrap() };
+    let (stopped, sent, received) = tokio::join!(
+        timeout(STEP, observe_stop),
+        timeout(STEP, reverse),
+        timeout(STEP, receive_reverse),
+    );
+    stopped.expect("read-limit STOP_SENDING timed out");
+    sent.expect("opposite send direction timed out");
+    assert_eq!(
+        received.expect("opposite receive direction timed out"),
+        b"still usable"
+    );
+}
+
+#[tokio::test]
 async fn dropping_successfully_finished_send_preserves_fin() {
     let (_dialer, _server, client_conn, server_conn) = pair().await;
     let (mut client_send, mut client_recv) = client_conn.open_bi().await.unwrap();
@@ -210,6 +256,31 @@ async fn explicit_reset_is_idempotent_and_reserved_codes_are_rejected() {
             code: AUTO_CODE_START
         }
     );
+
+    let (_send, mut reserved_recv) = client_conn.open_bi().await.unwrap();
+    assert_eq!(
+        reserved_recv.stop(AUTO_CODE_START).await.unwrap_err(),
+        ConnError::InvalidErrorCode {
+            code: AUTO_CODE_START
+        }
+    );
+}
+
+#[test]
+fn automatic_cleanup_codes_have_public_interpretations() {
+    let cases = [
+        (AUTO_RESET_DROPPED_SEND, AutomaticCode::DroppedSend),
+        (AUTO_STOP_DROPPED_RECV, AutomaticCode::DroppedRecv),
+        (AUTO_RESET_CANCELLED_WRITE, AutomaticCode::CancelledWrite),
+        (AUTO_RESET_CANCELLED_OPEN, AutomaticCode::CancelledOpenSend),
+        (AUTO_STOP_CANCELLED_OPEN, AutomaticCode::CancelledOpenRecv),
+        (AUTO_STOP_READ_LIMIT, AutomaticCode::ReadLimit),
+    ];
+    for (raw, interpreted) in cases {
+        assert_eq!(AutomaticCode::from_code(raw), Some(interpreted));
+    }
+    assert_eq!(AutomaticCode::from_code(AUTO_CODE_START + 15), None);
+    assert_eq!(AutomaticCode::from_code(AUTO_CODE_START - 1), None);
 }
 
 #[tokio::test]

@@ -75,6 +75,12 @@ Queued write commands have a separate 256 KiB per-connection byte budget;
 large `write_all` calls submit bounded chunks rather than copying the entire
 input into the driver queue.
 
+These are per-queue and per-connection bounds, not a total process memory cap.
+Transport buffers have their own configured limits, and applications must
+limit the number of live connections they retain. Mandatory cleanup metadata
+uses a separate reliable, unbounded channel so a full ordinary queue cannot
+discard cleanup; cancellation-only wake notifications are coalesced.
+
 Transient socket errors such as `WouldBlock` and `Interrupted` schedule a
 10-millisecond retry. That retry is tracked independently of QUIC transport
 timers and endpoint control work, so a temporarily blocked socket does not
@@ -254,6 +260,12 @@ that direction.
 
 ## Validation status
 
+Candidate `9f1d887` passed the recorded local command gate, GitHub Linux,
+macOS, FreeBSD, and Rust 1.88 jobs, and the cross-host transport gate. The
+[release audit](notes/2026-09-19-release-audit.md) subsequently added fixes that
+pass local validation. The changed candidate still needs fresh hosted and
+cross-host testing and release bookkeeping.
+
 There are three distinct evidence levels:
 
 1. Local validation runs deterministic sans-I/O tests and real-loopback Tokio
@@ -261,12 +273,15 @@ There are three distinct evidence levels:
    packaging checks. The working checklist is
    [`notes/2026-09-17-local-validation.md`](notes/2026-09-17-local-validation.md).
 2. GitHub validation runs the exact candidate commit on Linux, macOS, and the
-   FreeBSD VM workflow. A local Linux pass does not establish those runtime
-   gates.
+   FreeBSD VM workflow. Run `35180662812` records those platform results and the
+   Rust 1.88 job for candidate `9f1d887`; a local Linux pass alone would not
+   establish those runtime gates.
 3. The cross-host gate uses two actual hosts for overlapping connections from
    one fixed local port, bidirectional transfer, and sibling survival after one
-   close. Later CGNAT relay/application behavior belongs to the consuming
-   application rather than this library API.
+   close. The recorded 2026-09-18 run passed for candidate `9f1d887`; see
+   [`notes/2026-09-18-cross-host-validation.md`](notes/2026-09-18-cross-host-validation.md).
+   Later CGNAT relay/application behavior belongs to the consuming application
+   rather than this library API.
 
 Do not infer that a code example, compilation, or a prototype test completes
 any of these gates. Results must identify the tested commit, OS, and

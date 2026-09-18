@@ -363,13 +363,26 @@ psk = "xyz"
 
     #[test]
     fn endpoint_deadlines_and_caps_must_be_positive() {
-        let mut cfg = EndpointConfig::dial();
-        cfg.outgoing_handshake_timeout = Duration::ZERO;
-        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+        for set_deadline in [
+            |cfg: &mut EndpointConfig, value| cfg.outgoing_handshake_timeout = value,
+            |cfg: &mut EndpointConfig, value| cfg.incoming_handshake_timeout = value,
+            |cfg: &mut EndpointConfig, value| cfg.cleanup_timeout = value,
+        ] {
+            let mut cfg = EndpointConfig::dial();
+            set_deadline(&mut cfg, Duration::ZERO);
+            assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
 
-        let mut cfg = EndpointConfig::dial();
-        cfg.cleanup_timeout = Duration::MAX;
-        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+            let mut cfg = EndpointConfig::dial();
+            set_deadline(&mut cfg, MAX_ENDPOINT_DURATION + Duration::from_nanos(1));
+            assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+
+            let mut cfg = EndpointConfig::dial();
+            set_deadline(&mut cfg, MAX_ENDPOINT_DURATION);
+            assert!(
+                cfg.validate().is_ok(),
+                "the finite upper bound is inclusive"
+            );
+        }
 
         let mut cfg = EndpointConfig::dial();
         cfg.max_pending_incoming = 0;

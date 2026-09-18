@@ -6,6 +6,11 @@
   threat model, and limitations list.
 - [`shared-endpoints.md`](shared-endpoints.md) is the current Tokio endpoint API,
   ownership, cancellation, shutdown, and migration guide.
+- [`notes/2026-09-18-cross-host-validation.md`](notes/2026-09-18-cross-host-validation.md)
+  records the CGNAT-to-public-host transport run and the exact tested candidate.
+- [`notes/2026-09-19-release-audit.md`](notes/2026-09-19-release-audit.md)
+  maps the 51 agreed decisions to evidence and records audit fixes and remaining
+  release gates.
 - [`../SECURITY.md`](../SECURITY.md) states security status and reporting policy.
 - [`plans/2026-09-17-shared-endpoint-release.md`](plans/2026-09-17-shared-endpoint-release.md)
   is the active release-validation plan, consolidating endpoint/stream contracts

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use quietquic::client::Client;
 use quietquic::config::{ClientConfigFile, ServerSecrets};
-use quietquic::conn::{ConnError, Connection, ConnectionError};
+use quietquic::conn::{ConnError, Connection, ConnectionError, AUTO_CODE_START};
 use quietquic::server::Server;
 
 mod common;
@@ -158,6 +158,17 @@ async fn close_rejects_out_of_range_application_error_codes() {
         .await
         .expect_err("QUIC application codes are varints");
     assert_eq!(err, ConnError::InvalidErrorCode { code: 1 << 62 });
+
+    let err = client
+        .close(AUTO_CODE_START, b"reserved")
+        .await
+        .expect_err("automatic cleanup codes are reserved");
+    assert_eq!(
+        err,
+        ConnError::InvalidErrorCode {
+            code: AUTO_CODE_START
+        }
+    );
 }
 
 #[tokio::test]
