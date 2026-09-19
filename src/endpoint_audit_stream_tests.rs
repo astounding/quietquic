@@ -56,6 +56,15 @@ async fn reset_ordered_before_fin_ack_remains_the_stable_terminal_fact() {
     drop(finish);
 
     // Deliver the FIN and let the peer create its ACK, but hold that ACK back.
+    let acknowledgments = pair
+        .b
+        .core
+        .conn_mut(server.handle())
+        .unwrap()
+        .conn_mut()
+        .stats()
+        .frame_tx
+        .acks;
     pair.a.pump();
     while let Some(tx) = pair.a.pending_transmits.pop_front() {
         pair.b
@@ -63,6 +72,29 @@ async fn reset_ordered_before_fin_ack_remains_the_stable_terminal_fact() {
             .handle_datagram(Instant::now(), pair.a.shared.local, &tx.contents);
     }
     pair.b.pump();
+    // ACKs may be delayed. Drive the peer's actual protocol deadlines without
+    // delivering its packets to the sender, rather than assuming an immediate
+    // transmit or relying on the wall-clock speed of the test machine.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while pair
+            .b
+            .core
+            .conn_mut(server.handle())
+            .unwrap()
+            .conn_mut()
+            .stats()
+            .frame_tx
+            .acks
+            == acknowledgments
+        {
+            let deadline = pair.b.core.next_protocol_timeout().unwrap();
+            tokio::time::sleep_until(deadline.into()).await;
+            pair.b.core.handle_timeout(Instant::now());
+            pair.b.pump();
+        }
+    })
+    .await
+    .expect("peer must generate the withheld ACK");
     assert!(!pair.b.pending_transmits.is_empty());
 
     let mut reset = Box::pin(send.reset(41));
